@@ -25,7 +25,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import type * as vscode from 'vscode';
 
-const debug = process.env.PIXEL_AGENTS_DEBUG !== '0';
+const debug = process.env.PIXEL_AGENTS_DEBUG === '1';
 
 import type { HookProvider } from '../../core/src/provider.js';
 import type { TeamProvider } from '../../core/src/teamProvider.js';
@@ -42,7 +42,7 @@ import {
   GLOBAL_SCAN_ACTIVE_MIN_SIZE,
   PROJECT_SCAN_INTERVAL_MS,
 } from './constants.js';
-import { seedContextUsage } from './contextUsage.js';
+import { resetConversationSummary, seedContextUsage, seedSessionSummary } from './contextUsage.js';
 import type { DismissalTracker } from './dismissalTracker.js';
 import { assignPaletteIfNeeded } from './paletteAssigner.js';
 import { pathsMatch } from './pathKey.js';
@@ -113,6 +113,7 @@ export function startFileWatching(
   // give an agent adopted or restored mid-session a context gauge without
   // replaying its whole transcript.
   seedContextUsage(agentId, agents, getHookProvider());
+  seedSessionSummary(agentId, agents, getHookProvider());
 
   // Single polling approach: reliable on all platforms (macOS, Linux, WSL2, Windows).
   // Previously used triple-redundant fs.watch + fs.watchFile + setInterval, but
@@ -200,6 +201,19 @@ export function startFileWatching(
   pollingTimers.set(agentId, interval);
 }
 
+const READ_CHUNK_BYTES = 1024 * 1024;
+const MAX_READ_BYTES_PER_TICK = 4 * 1024 * 1024;
+
+/** Bytes of `buf[0..len)` up to the last complete UTF-8 char -- a read that
+ *  ends mid-char would otherwise decode it as U+FFFD for good. */
+function completeUtf8Length(buf: Buffer, len: number): number {
+  let i = len - 1;
+  while (i >= 0 && len - i <= 3 && (buf[i] & 0xc0) === 0x80) i--; // continuation bytes
+  if (i < 0 || buf[i] < 0xc0) return len; // ASCII (or stray continuation) ends it
+  const need = buf[i] >= 0xf0 ? 4 : buf[i] >= 0xe0 ? 3 : 2;
+  return len - i >= need ? len : i;
+}
+
 export function readNewLines(
   agentId: number,
   agents: AgentStateStore,
@@ -212,37 +226,54 @@ export function readNewLines(
     const stat = fs.statSync(agent.jsonlFile);
     if (stat.size <= agent.fileOffset) return;
 
-    // Cap single read at 64KB to prevent blocking on massive JSONL dumps.
-    // Remaining data will be picked up on the next poll cycle.
-    const MAX_READ_BYTES = 65536;
-    const bytesToRead = Math.min(stat.size - agent.fileOffset, MAX_READ_BYTES);
-    const buf = Buffer.alloc(bytesToRead);
-    const fd = fs.openSync(agent.jsonlFile, 'r');
-    fs.readSync(fd, buf, 0, buf.length, agent.fileOffset);
-    fs.closeSync(fd);
-    agent.fileOffset += bytesToRead;
-
-    const text = agent.lineBuffer + buf.toString('utf-8');
-    const lines = text.split('\n');
-    agent.lineBuffer = lines.pop() || '';
-
-    const hasLines = lines.some((l) => l.trim());
-    if (hasLines) {
-      // New data arriving — cancel timers (data flowing means agent is still active).
-      // When hooks are active, don't clear permission state here — the hook gave us a
-      // definitive signal that permission is needed. Only a new user prompt or tool_result
-      // (processed in transcriptParser) should clear it.
-      cancelWaitingTimer(agentId, waitingTimers);
-      cancelPermissionTimer(agentId, permissionTimers);
-      if (agent.permissionSent && !agent.hookDelivered && !agent.leadAgentId) {
-        agent.permissionSent = false;
-        agents.broadcast({ type: 'agentToolPermissionClear', id: agentId });
+    // Read in 1MB chunks until caught up, bounded per tick so a huge replay
+    // can't block the event loop; the rest is picked up on the next poll.
+    const file = agent.jsonlFile;
+    let budget = MAX_READ_BYTES_PER_TICK;
+    while (budget > 0 && agent.fileOffset < stat.size) {
+      const buf = Buffer.alloc(Math.min(stat.size - agent.fileOffset, READ_CHUNK_BYTES, budget));
+      const fd = fs.openSync(file, 'r');
+      let read: number;
+      try {
+        read = fs.readSync(fd, buf, 0, buf.length, agent.fileOffset);
+      } finally {
+        fs.closeSync(fd);
       }
-    }
+      // Stop before a multi-byte char split by the read; it's re-read whole next time.
+      const complete = completeUtf8Length(buf, read);
+      if (complete === 0) break;
+      agent.fileOffset += complete;
+      budget -= complete;
 
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      processTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers);
+      const chunk = buf.toString('utf-8', 0, complete);
+      const lastNewline = chunk.lastIndexOf('\n');
+      if (lastNewline < 0) {
+        agent.lineBuffer += chunk; // still inside one long record
+        continue;
+      }
+      const lines = (agent.lineBuffer + chunk.slice(0, lastNewline)).split('\n');
+      agent.lineBuffer = chunk.slice(lastNewline + 1);
+
+      const hasLines = lines.some((l) => l.trim());
+      if (hasLines) {
+        // New data arriving — cancel timers (data flowing means agent is still active).
+        // When hooks are active, don't clear permission state here — the hook gave us a
+        // definitive signal that permission is needed. Only a new user prompt or tool_result
+        // (processed in transcriptParser) should clear it.
+        cancelWaitingTimer(agentId, waitingTimers);
+        cancelPermissionTimer(agentId, permissionTimers);
+        if (agent.permissionSent && !agent.hookDelivered && !agent.leadAgentId) {
+          agent.permissionSent = false;
+          agents.broadcast({ type: 'agentToolPermissionClear', id: agentId });
+        }
+      }
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        processTranscriptLine(agentId, line, agents, waitingTimers, permissionTimers);
+      }
+      // A line may have removed the agent or moved it to another file.
+      if (agents.get(agentId) !== agent || agent.jsonlFile !== file) break;
     }
   } catch (e) {
     // ENOENT is expected for hook-detected agents where the JSONL file hasn't been created yet
@@ -682,6 +713,7 @@ export function scanForTeammateFiles(
       existingTeammate.lastDataAt = Date.now();
       existingTeammate.linesProcessed = 0;
       existingTeammate.isWaiting = false;
+      resetConversationSummary(existingTeammate.id, existingTeammate, agents);
       existingTeammate.teamUsesTmux = parentAgent?.teamUsesTmux;
       if (ownSessionId && existingTeammate.sessionId !== ownSessionId) {
         existingTeammate.sessionId = ownSessionId;
@@ -1105,7 +1137,7 @@ function adoptExternalSession(
   permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
 
   persistAgents: () => void,
-  directoryName?: string,
+  directoryName: string | undefined = folderNameFromTranscript(jsonlFile),
 ): void {
   const id = nextAgentIdRef.current++;
   // Decide whether to replay the existing file content or skip to its end.
@@ -1220,6 +1252,28 @@ export function startExternalSessionScanning(
   }, EXTERNAL_SCAN_INTERVAL_MS);
 }
 
+/** readdir results per dir, reused while the dir's own mtime is unchanged.
+ *  Adding, removing or renaming a file bumps it; a file growing does not, so
+ *  callers still stat the files themselves -- this only saves the listing. */
+const jsonlListingCache = new Map<string, { mtimeMs: number; files: string[] }>();
+const DIR_LISTING_SETTLE_MS = 2000;
+
+/** Full paths of the .jsonl files in `dir` (throws if it can't be read). */
+function listJsonlFiles(dir: string): string[] {
+  const mtimeMs = fs.statSync(dir).mtimeMs;
+  const cached = jsonlListingCache.get(dir);
+  if (cached?.mtimeMs === mtimeMs) return cached.files;
+  const files = fs
+    .readdirSync(dir)
+    .filter((f) => f.endsWith('.jsonl'))
+    .map((f) => path.join(dir, f));
+  // A file created within the mtime's resolution right after this read would
+  // leave the mtime unchanged; only trust listings of dirs quiet for a moment.
+  if (Date.now() - mtimeMs > DIR_LISTING_SETTLE_MS) jsonlListingCache.set(dir, { mtimeMs, files });
+  else jsonlListingCache.delete(dir);
+  return files;
+}
+
 /** Scan a single project dir for external sessions. */
 export function scanExternalDir(
   projectDir: string,
@@ -1238,10 +1292,7 @@ export function scanExternalDir(
 ): void {
   let files: string[];
   try {
-    files = fs
-      .readdirSync(projectDir)
-      .filter((f) => f.endsWith('.jsonl'))
-      .map((f) => path.join(projectDir, f));
+    files = listJsonlFiles(projectDir);
   } catch {
     return;
   }
@@ -1394,6 +1445,27 @@ function directoryNameFromProjectDir(dirName: string): string {
   return parts[parts.length - 1] || dirName;
 }
 
+/** Folder the session ran in, from the `cwd` its records carry. The project
+ *  dir name can't be decoded back (spaces, dots and dashes all became '-', so
+ *  "Workshop 3" reads as "3"); the transcript states it outright. */
+function folderNameFromTranscript(file: string): string | undefined {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      // Desktop transcripts open with ~19 KB of queue-operation records.
+      const buf = Buffer.alloc(65_536);
+      const read = fs.readSync(fd, buf, 0, buf.length, 0);
+      const cwd = /"cwd":"((?:[^"\\]|\\.)*)"/.exec(buf.toString('utf8', 0, read))?.[1];
+      if (!cwd) return undefined;
+      return (JSON.parse(`"${cwd}"`) as string).split(/[\\/]/).filter(Boolean).pop();
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return undefined;
+  }
+}
+
 /** Scan every session root the active provider exposes for active sessions
  *  (global discovery — powers the "Watch All Sessions" toggle). */
 function scanGlobalProjectDirs(
@@ -1429,15 +1501,29 @@ function scanGlobalProjectDirs(
 
     let files: string[];
     try {
-      files = fs
-        .readdirSync(dirPath)
-        .filter((f) => f.endsWith('.jsonl'))
-        .map((f) => path.join(dirPath, f));
+      files = listJsonlFiles(dirPath)
+        // agent-*.jsonl are sub-agent transcripts (remote ssh-* sessions keep
+        // them beside the main one), not conversations of their own.
+        .filter((f) => !path.basename(f).startsWith('agent-'));
     } catch {
       continue;
     }
 
     for (const file of files) {
+      // Dismissed from the inbox ("seen"): stays known until the conversation
+      // moves again, then becomes adoptable like any other.
+      const seenMtime = dismissalTracker!.getSeededMtime(file);
+      if (seenMtime !== undefined) {
+        try {
+          if (fs.statSync(file).mtimeMs > seenMtime) {
+            dismissalTracker!.clearSeededMtime(file);
+            knownJsonlFiles.delete(file);
+          }
+        } catch {
+          /* file gone: nothing to adopt */
+        }
+        continue;
+      }
       if (knownJsonlFiles.has(file)) continue;
       let tracked = false;
       for (const agent of agents.values()) {
@@ -1458,6 +1544,7 @@ function scanGlobalProjectDirs(
 
       const directoryName =
         directoryNameResolver?.({ projectDir: dirPath }) ??
+        folderNameFromTranscript(file) ??
         directoryNameFromProjectDir(path.basename(dirPath));
       knownJsonlFiles.add(file);
       console.log(
@@ -1557,6 +1644,7 @@ export function reassignAgentToFile(
   agent.jsonlFile = newFilePath;
   agent.fileOffset = 0;
   agent.lineBuffer = '';
+  resetConversationSummary(agentId, agent, agents);
   persistAgents();
 
   // Start watching new file

@@ -17,8 +17,17 @@ const DEFAULT_FLOOR_SPRITE: SpriteData = Array.from(
   () => Array(TILE_SIZE).fill(FALLBACK_FLOOR_COLOR) as string[],
 );
 
+/** 16×16 magenta tile for unknown patterns. One shared instance so the per-zoom
+ *  sprite cache (WeakMap by identity) hits instead of minting a canvas per draw. */
+const ERROR_FLOOR_SPRITE: SpriteData = Array.from(
+  { length: 16 },
+  () => Array(16).fill(CANVAS_ERROR_TILE_COLOR) as string[],
+);
+
 /** Module-level storage for floor tile sprites (set once on load) */
 let floorSprites: SpriteData[] = [];
+/** Bumped on every setFloorSprites so render caches can tell the sprites changed. */
+let floorSpritesVersion = 0;
 
 // Re-export WALL_COLOR from constants for backward compatibility
 export { WALL_COLOR } from '../constants.js';
@@ -26,7 +35,12 @@ export { WALL_COLOR } from '../constants.js';
 /** Set floor tile sprites (called once when extension sends floorTilesLoaded) */
 export function setFloorSprites(sprites: SpriteData[]): void {
   floorSprites = sprites;
+  floorSpritesVersion++;
   clearColorizeCache();
+}
+
+export function getFloorSpritesVersion(): number {
+  return floorSpritesVersion;
 }
 
 /** Get the raw (grayscale) floor sprite for a pattern index (1-7 -> array index 0-6).
@@ -64,13 +78,7 @@ export function getColorizedFloorSprite(patternIndex: number, color: ColorValue)
   const key = `floor-${patternIndex}-${color.h}-${color.s}-${color.b}-${color.c}`;
 
   const base = getFloorSprite(patternIndex);
-  if (!base) {
-    // Return a 16x16 magenta error tile
-    const err: SpriteData = Array.from({ length: 16 }, () =>
-      Array(16).fill(CANVAS_ERROR_TILE_COLOR),
-    );
-    return err;
-  }
+  if (!base) return ERROR_FLOOR_SPRITE;
 
   // Floor tiles are always colorized (grayscale patterns need Photoshop-style Colorize)
   return getColorizedSprite(key, base, { ...color, colorize: true });

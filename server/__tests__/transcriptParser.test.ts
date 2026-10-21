@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentStateStore } from '../src/agentStateStore.js';
+import { PERMISSION_TIMER_DELAY_MS } from '../src/constants.js';
 import { claudeProvider } from '../src/providers/hook/claude/claude.js';
 import {
   processTranscriptLine,
@@ -347,5 +348,102 @@ describe('transcriptParser: teammate spawn results (new-harness implicit teams)'
     );
     expect(agent.teamName).toBeUndefined();
     expect(agent.isTeamLead).toBeUndefined();
+  });
+});
+
+describe('transcriptParser: permission guess respects the permission mode', () => {
+  let agents: AgentStateStore;
+  let messages: Array<Record<string, unknown>>;
+  const waitingTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  const permissionTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  beforeEach(() => {
+    setHookProvider(claudeProvider);
+    agents = new AgentStateStore();
+    agents.set(1, createTestAgent());
+    messages = [];
+    agents.on('broadcast', (msg) => messages.push(msg as Record<string, unknown>));
+    vi.useFakeTimers();
+    return () => vi.useRealTimers();
+  });
+
+  function prompt(mode: string): void {
+    const line = JSON.stringify({ type: 'user', permissionMode: mode, message: { content: 'go' } });
+    processTranscriptLine(1, line, agents, waitingTimers, permissionTimers);
+  }
+
+  function openTool(name: string): boolean {
+    processTranscriptLine(
+      1,
+      agentToolUseRecord('toolu_1', name, {}),
+      agents,
+      waitingTimers,
+      permissionTimers,
+    );
+    vi.advanceTimersByTime(PERMISSION_TIMER_DELAY_MS + 100);
+    return messages.some((m) => m.type === 'agentToolPermission');
+  }
+
+  it('in auto mode a slow tool is just slow -- no approval guessed', () => {
+    prompt('auto');
+    expect(openTool('Bash')).toBe(false);
+  });
+
+  it('in auto mode an open question still waits on the user', () => {
+    prompt('auto');
+    expect(openTool('AskUserQuestion')).toBe(true);
+  });
+
+  it('in default mode a slow tool may be a permission prompt', () => {
+    prompt('default');
+    expect(openTool('Bash')).toBe(true);
+  });
+});
+
+describe('transcriptParser: local slash commands', () => {
+  it('puts the wait back after /context, keeping when it began', () => {
+    const agents = new AgentStateStore();
+    const messages: Array<Record<string, unknown>> = [];
+    agents.on('broadcast', (msg) => messages.push(msg as Record<string, unknown>));
+    const agent = createTestAgent({ hookDelivered: true, isWaiting: true, waitingSince: 1_000 });
+    agents.set(1, agent);
+    const timers = new Map<number, ReturnType<typeof setTimeout>>();
+    const line = (r: Record<string, unknown>) =>
+      processTranscriptLine(1, JSON.stringify(r), agents, timers, timers);
+
+    line({ type: 'user', message: { content: '<command-name>/context</command-name>' } });
+    expect(agent.isWaiting).toBe(false);
+    line({ type: 'system', subtype: 'local_command', content: '<local-command-stdout>..' });
+
+    expect(agent.isWaiting).toBe(true);
+    expect(messages.at(-1)).toMatchObject({ type: 'agentStatus', status: 'waiting', since: 1_000 });
+  });
+
+  it('an interrupt ends the turn even with hooks on (Stop does not fire)', () => {
+    const agents = new AgentStateStore();
+    const messages: Array<Record<string, unknown>> = [];
+    agents.on('broadcast', (msg) => messages.push(msg as Record<string, unknown>));
+    const agent = createTestAgent({ hookDelivered: true });
+    agents.set(1, agent);
+    const timers = new Map<number, ReturnType<typeof setTimeout>>();
+    processTranscriptLine(1, agentToolUseRecord('t1', 'Bash', {}), agents, timers, timers);
+    processTranscriptLine(
+      1,
+      JSON.stringify({
+        type: 'user',
+        timestamp: '2026-10-03T10:00:02.000Z',
+        message: { content: [{ type: 'text', text: '[Request interrupted by user]' }] },
+      }),
+      agents,
+      timers,
+      timers,
+    );
+
+    expect(agent.isWaiting).toBe(true);
+    expect(messages.at(-1)).toMatchObject({
+      type: 'agentStatus',
+      status: 'waiting',
+      since: Date.parse('2026-10-03T10:00:02.000Z'),
+    });
   });
 });

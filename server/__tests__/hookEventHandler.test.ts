@@ -178,6 +178,34 @@ describe('HookEventHandler', () => {
     expect(waitMsg?.awaitingInput).toBeFalsy();
   });
 
+  it('Stop then idle_prompt keeps the first since; a repeat Stop is not re-announced', () => {
+    vi.useFakeTimers();
+    try {
+      const agent = createTestAgent({ id: 1 });
+      agents.set(1, agent);
+      handler.registerAgent('sess-1', 1);
+      const waits = () =>
+        mockWebview.messages.filter((m) => m.type === 'agentStatus' && m.status === 'waiting');
+
+      handler.handleEvent('claude', { hook_event_name: 'Stop', session_id: 'sess-1' });
+      const since = agent.waitingSince;
+      vi.advanceTimersByTime(60_000);
+      handler.handleEvent('claude', { hook_event_name: 'Stop', session_id: 'sess-1' });
+      expect(waits()).toHaveLength(1);
+      handler.handleEvent('claude', {
+        hook_event_name: 'Notification',
+        session_id: 'sess-1',
+        notification_type: 'idle_prompt',
+      });
+
+      expect(agent.waitingSince).toBe(since);
+      expect(waits()).toHaveLength(2);
+      expect(waits()[1]).toMatchObject({ since, awaitingInput: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('Stop clears foreground tools but preserves background agents', () => {
     const agent = createTestAgent({ id: 1 });
     agent.activeToolIds.add('fg-tool');

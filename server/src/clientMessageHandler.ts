@@ -1,3 +1,5 @@
+import * as fs from 'fs';
+
 import type { StateAdapter } from '../../core/src/adapter.js';
 import type { HookProvider } from '../../core/src/provider.js';
 import { resendAgentActivity } from './agentActivityResend.js';
@@ -21,6 +23,7 @@ import {
 import { collectDirectorySuggestions } from './directorySuggestions.js';
 import { hostDirectory } from './hostDirectory.js';
 import { readLayoutFromFile, writeLayoutToFile } from './layoutPersistence.js';
+import { getLatestPlanUsage } from './planUsage.js';
 import type { ConsentEffects } from './providers/hook/consentExecutor.js';
 import { applyConsentChoice } from './providers/hook/consentExecutor.js';
 import { hooksConsentRequest } from './providers/hook/consentGate.js';
@@ -166,11 +169,14 @@ export function handleClientMessage(
       const id = msg.id as number;
       const agent = store.get(id);
       if (agent && runtime) {
-        // dispose() is a no-op for agents with no terminal, so this is safe for
-        // both shapes. The PTY's onExit handler does the store cleanup for
-        // PTY-backed agents; do it here too so external agents (and a PTY that
-        // never exits) are still removed promptly.
         ctx.ptyManager?.dispose(id);
+        // Closed is "seen, not gone": remember how far the conversation had got
+        // so the scanners re-adopt it once it moves again (a new prompt, a resume).
+        try {
+          runtime.dismissalTracker.seedMtime(agent.jsonlFile, fs.statSync(agent.jsonlFile).mtimeMs);
+        } catch {
+          /* transcript gone: nothing to come back */
+        }
         runtime.closeAgent(id);
       }
       break;
@@ -639,6 +645,10 @@ function handleWebviewReady(send: WsSend, ctx: ClientMessageContext): void {
       }
     }
   }
+
+  // 9. Plan limits as of the last poll (the next poll broadcasts on its own).
+  const planUsage = getLatestPlanUsage();
+  if (planUsage) send({ ...planUsage });
 }
 
 /**

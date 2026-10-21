@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { AgentRuntime } from '../src/agentRuntime.js';
 import { AgentStateStore } from '../src/agentStateStore.js';
 import { claudeProvider } from '../src/providers/hook/claude/claude.js';
+import type { AgentState } from '../src/types.js';
 
 /**
  * D5 gate (tier-3 multi-server hook fan-out plan): the hook script now
@@ -74,5 +75,74 @@ describe('AgentRuntime -- D5 foreign-session gate', () => {
     runtime.startProjectScan(dir); // marks `dir` as owned/tracked
     fireSessionStartThenStop('d5-tracked-dir', dir);
     expect(store.size).toBe(1);
+  });
+});
+
+describe('AgentRuntime -- removeAgent cleanup', () => {
+  let runtime: AgentRuntime;
+  let store: AgentStateStore;
+
+  afterEach(() => runtime?.dispose());
+
+  function agent(overrides: Partial<AgentState>): AgentState {
+    return {
+      id: 1,
+      sessionId: '',
+      isExternal: true,
+      projectDir: '/test',
+      jsonlFile: `/test/${crypto.randomUUID()}.jsonl`,
+      fileOffset: 0,
+      lineBuffer: '',
+      activeToolIds: new Set(),
+      activeToolStatuses: new Map(),
+      activeToolNames: new Map(),
+      activeSubagentToolIds: new Map(),
+      activeSubagentToolNames: new Map(),
+      backgroundAgentToolIds: new Set(),
+      isWaiting: false,
+      permissionSent: false,
+      hadToolsInTurn: false,
+      lastDataAt: 0,
+      linesProcessed: 0,
+      seenUnknownRecordTypes: new Set(),
+      hookDelivered: false,
+      contextTokens: 0,
+      maxContextTokens: 200_000,
+      ...overrides,
+    } as AgentState;
+  }
+
+  const stop = (sessionId: string) =>
+    runtime.handleHookEvent('claude', { hook_event_name: 'Stop', session_id: sessionId });
+
+  it('removing a lead takes its teammates with it; removing a session-sharing teammate leaves the lead live', () => {
+    store = new AgentStateStore();
+    runtime = new AgentRuntime(store, claudeProvider);
+    store.set(1, agent({ id: 1, sessionId: 'sess-lead' }));
+    store.set(2, agent({ id: 2, sessionId: 'sess-lead', leadAgentId: 1, spawnToolUseId: 'tu-1' }));
+    store.set(3, agent({ id: 3, sessionId: 'sess-mate', leadAgentId: 1 }));
+    runtime.registerAgent('sess-lead', 1);
+    runtime.registerAgent('sess-mate', 3);
+
+    runtime.removeAgent(2);
+    stop('sess-lead');
+    expect(store.get(1)?.isWaiting).toBe(true);
+
+    runtime.removeAgent(1);
+    expect(store.size).toBe(0);
+  });
+
+  it('unregisters the removed agent so its session no longer routes to a reused id', () => {
+    store = new AgentStateStore();
+    runtime = new AgentRuntime(store, claudeProvider);
+    store.set(1, agent({ id: 1, sessionId: 'sess-gone' }));
+    runtime.registerAgent('sess-gone', 1);
+
+    runtime.removeAgent(1);
+    const reused = agent({ id: 1, sessionId: 'sess-new' });
+    store.set(1, reused);
+    stop('sess-gone');
+
+    expect(reused.isWaiting).toBe(false);
   });
 });

@@ -76,7 +76,6 @@ export function OfficeCanvas({
   onDeleteSelected,
   onRotateSelected,
   onDrop,
-  editorTick: _editorTick,
   zoom,
   onZoomChange,
   panRef,
@@ -97,6 +96,11 @@ export function OfficeCanvas({
   const isEraseDraggingRef = useRef(false);
   // Zoom scroll accumulator for trackpad pinch sensitivity
   const zoomAccumulatorRef = useRef(0);
+  // Props the render loop reads every frame. Read through a ref so a prop change
+  // doesn't tear down and restart the loop (editor ticks fire on every action).
+  const renderPropsRef = useRef({ isEditMode, editorState, zoom, showAreas, activeAreaLabel });
+  renderPropsRef.current = { isEditMode, editorState, zoom, showAreas, activeAreaLabel };
+
   // Clamp pan so the map edge can't go past a margin inside the viewport
   const clampPan = useCallback(
     (px: number, py: number): { x: number; y: number } => {
@@ -124,8 +128,11 @@ export function OfficeCanvas({
     if (!canvas || !container) return;
     const rect = container.getBoundingClientRect();
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = Math.round(rect.width * dpr);
-    canvas.height = Math.round(rect.height * dpr);
+    const width = Math.round(rect.width * dpr);
+    const height = Math.round(rect.height * dpr);
+    // Assigning width/height reallocates + clears the backing store — only when it changed
+    if (canvas.width !== width) canvas.width = width;
+    if (canvas.height !== height) canvas.height = height;
     canvas.style.width = `${rect.width}px`;
     canvas.style.height = `${rect.height}px`;
     // No ctx.scale(dpr) — we render directly in device pixels
@@ -139,7 +146,13 @@ export function OfficeCanvas({
 
     const observer = new ResizeObserver(() => resizeCanvas());
     if (containerRef.current) {
-      observer.observe(containerRef.current);
+      // device-pixel-content-box also fires when devicePixelRatio changes
+      // (window dragged to another monitor, browser zoom), not just on CSS resize.
+      try {
+        observer.observe(containerRef.current, { box: 'device-pixel-content-box' });
+      } catch {
+        observer.observe(containerRef.current); // Safari: no device-pixel-content-box
+      }
     }
 
     const stop = startGameLoop(canvas, {
@@ -147,6 +160,8 @@ export function OfficeCanvas({
         officeState.update(dt);
       },
       render: (ctx) => {
+        const { isEditMode, editorState, zoom, showAreas, activeAreaLabel } =
+          renderPropsRef.current;
         // Canvas dimensions are in device pixels
         const w = canvas.width;
         const h = canvas.height;
@@ -229,17 +244,7 @@ export function OfficeCanvas({
       stop();
       observer.disconnect();
     };
-  }, [
-    officeState,
-    resizeCanvas,
-    isEditMode,
-    editorState,
-    _editorTick,
-    zoom,
-    panRef,
-    showAreas,
-    activeAreaLabel,
-  ]);
+  }, [officeState, resizeCanvas, panRef]);
 
   // Convert CSS mouse coords to world (sprite pixel) coords
   const screenToWorld = useCallback(

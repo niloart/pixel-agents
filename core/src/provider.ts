@@ -64,6 +64,16 @@ export type AgentEvent =
 
 // ── Hook-based Provider (CLIs with hooks APIs) ────────────────
 
+/** USD per million tokens, one rate per usage counter. Cache writes are priced
+ *  by TTL: 5-minute and 1-hour entries cost different multiples of input. */
+export interface ModelPricing {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+}
+
 export interface HookProvider {
   readonly kind: 'hook';
   readonly id: string;
@@ -98,6 +108,14 @@ export interface HookProvider {
   formatToolStatus(toolName: string, input?: unknown): string;
   /** Tools that don't trigger permission timers */
   readonly permissionExemptTools: ReadonlySet<string>;
+  /** Tools that by themselves wait on the user (a question, a plan to approve).
+   *  Heuristic mode flags them even when exempt and whatever the permission
+   *  mode -- an open one means the conversation is waiting on you. */
+  readonly userInputTools?: ReadonlySet<string>;
+  /** Permission modes, as transcripts record them, in which ordinary tools never
+   *  stop for approval. Heuristic mode trusts no "slow tool = permission prompt"
+   *  guess in these: the tool is just slow. */
+  readonly promptFreeModes?: ReadonlySet<string>;
   /** Tools that spawn sub-agent characters */
   readonly subagentToolNames: ReadonlySet<string>;
   /** Tools that should show the "reading" character animation instead of "typing".
@@ -115,6 +133,13 @@ export interface HookProvider {
    *  Return undefined for an unrecognized model; the runtime then keeps its
    *  previous estimate and widens it if a context ever exceeds it. */
   contextWindowForModel?(model: string | undefined): number | undefined;
+
+  /** API list price, USD per million tokens, for a model id this CLI reports.
+   *  Turns the transcript's token counters into what the conversation would
+   *  cost: the counters differ in price by up to ~100x (a cache read vs an
+   *  output token), so a raw token total says little about cost. Undefined for
+   *  unrecognized models -- the spend then shows tokens only. */
+  pricingForModel?(model: string | undefined): ModelPricing | undefined;
 
   // ── Optional file fallback (heuristic mode) ──
 

@@ -9,7 +9,7 @@ import { cancelPermissionTimer, cancelWaitingTimer } from './timerManager.js';
 import { notifyBackgroundAgentCompleted } from './transcriptParser.js';
 import type { AgentState } from './types.js';
 
-const debug = process.env.PIXEL_AGENTS_DEBUG !== '0';
+const debug = process.env.PIXEL_AGENTS_DEBUG === '1';
 
 /** Normalized hook event received from any provider's hook script via the HTTP server. */
 export interface HookEvent {
@@ -118,8 +118,10 @@ export class HookEventHandler {
     }
   }
 
-  /** Remove an agent's session mapping (called on agent removal/terminal close). */
-  unregisterAgent(sessionId: string): void {
+  /** Remove an agent's session mapping (called on agent removal/terminal close).
+   *  With agentId, only when the session still routes to that agent. */
+  unregisterAgent(sessionId: string, agentId?: number): void {
+    if (agentId !== undefined && this.sessionRouter.resolve(sessionId) !== agentId) return;
     this.sessionRouter.unregister(sessionId);
   }
 
@@ -763,14 +765,22 @@ export class HookEventHandler {
       }
     }
 
+    // Stop then Notification(idle_prompt) ~60s later both land here: keep the
+    // first `since` (as the JSONL path does) and only re-announce to upgrade
+    // "Done" to "Waiting for input".
+    const alreadyWaiting = agent.isWaiting;
     agent.isWaiting = true;
+    if (!alreadyWaiting) agent.waitingSince = Date.now();
     agent.permissionSent = false;
     agent.hadToolsInTurn = false;
     agent.currentHookToolId = undefined;
+    if (alreadyWaiting && !awaitingInput) return;
     this.agents.broadcast({
       type: 'agentStatus',
       id: agentId,
       status: 'waiting',
+      since: agent.waitingSince,
+      prompt: agent.lastPrompt,
       awaitingInput,
     });
   }

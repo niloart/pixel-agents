@@ -131,17 +131,17 @@ describe('AgentRuntime -- restore preserves palette/hueShift', () => {
     );
     storeA.persist();
 
-    // Capture the record our explicit persist() wrote BEFORE disposing
-    // the runtime: dispose() walks the store and persists removals, which
-    // would otherwise clobber the captured record or push an empty entry
-    // onto `saved`.
     expect(adapterA.saved.length).toBeGreaterThanOrEqual(1);
-    const persisted = adapterA.saved[0];
+    const persisted = adapterA.saved.at(-1)!;
     expect(persisted[0].palette).toBe(5);
     expect(persisted[0].hueShift).toBe(270);
 
+    // Shutdown must not persist its teardown: an `agents: []` save here would
+    // wipe what the next startup restores.
+    const savesBeforeDispose = adapterA.saved.length;
     runtime.dispose();
     runtime = undefined;
+    expect(adapterA.saved.length).toBe(savesBeforeDispose);
 
     // Phase 2: a fresh store + runtime restore from the record phase 1
     // wrote. The new adapter hands back exactly what phase 1 persisted.

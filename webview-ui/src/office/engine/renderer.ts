@@ -42,11 +42,17 @@ import {
   VOID_TILE_DASH_PATTERN,
   VOID_TILE_OUTLINE_COLOR,
 } from '../../constants.js';
-import { getColorizedFloorSprite, hasFloorSprites, WALL_COLOR } from '../floorTiles.js';
+import {
+  getColorizedFloorSprite,
+  getFloorSpritesVersion,
+  hasFloorSprites,
+  WALL_COLOR,
+} from '../floorTiles.js';
 import { mapOffset } from '../projection.js';
 import {
   getCarpetJunctionSprite,
   getCarpetPaletteKey,
+  getCarpetSpritesVersion,
   hasCarpetSprites,
 } from '../sprites/carpetTiles.js';
 import { getPetSprites } from '../sprites/petSpriteData.js';
@@ -63,7 +69,12 @@ import type {
   TileType as TileTypeVal,
 } from '../types.js';
 import { CharacterState, TILE_SIZE, TileType } from '../types.js';
-import { getWallInstances, hasWallSprites, wallColorToHex } from '../wallTiles.js';
+import {
+  getWallInstances,
+  getWallSpritesVersion,
+  hasWallSprites,
+  wallColorToHex,
+} from '../wallTiles.js';
 import { getCharacterSprite } from './characters.js';
 import { renderMatrixEffect } from './matrixEffect.js';
 import { getPetSpriteData } from './petEntity.js';
@@ -333,6 +344,112 @@ export function renderTileGrid(
       ctx.drawImage(cached, offsetX + c * s, offsetY + r * s);
     }
   }
+}
+
+// ── Static layer caches ─────────────────────────────────────────
+
+function sameDeps(a: readonly unknown[] | undefined, b: readonly unknown[]): boolean {
+  return !!a && a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * Above this many device pixels the ground layer is drawn per frame instead of
+ * cached (64×64 tiles at zoom 10 would be a ~420 MB offscreen canvas).
+ * ponytail: whole-map cache with a size ceiling; cache only the viewport if big maps at high zoom matter.
+ */
+const GROUND_LAYER_MAX_PIXELS = 4096 * 4096;
+
+let groundLayer: { canvas: HTMLCanvasElement; deps: unknown[] } | null = null;
+let wallInstanceCache: { instances: FurnitureInstance[]; deps: unknown[] } | null = null;
+
+/**
+ * Floor + wall base + carpet + area wash. None of it moves per frame, so it is
+ * rendered once into an offscreen canvas and blitted with one drawImage. The
+ * layout is immutable (editor ops return new arrays), so array identity plus
+ * zoom/area flags/sprite versions is a complete cache key. Pan only moves the
+ * blit position. The canvas carries a one-tile margin because carpet junction
+ * sprites overhang the map edge by half a tile.
+ */
+function renderGroundLayer(
+  ctx: CanvasRenderingContext2D,
+  tileMap: TileTypeVal[][],
+  offsetX: number,
+  offsetY: number,
+  zoom: number,
+  tileColors: Array<ColorValue | null> | undefined,
+  layoutCols: number | undefined,
+  cols: number,
+  rows: number,
+  carpetTiles: Array<CarpetTile | null> | undefined,
+  areas: AreaDefinition[] | undefined,
+  areaTiles: Array<string | null> | undefined,
+  showAreas: boolean | undefined,
+  activeAreaLabel: string | null | undefined,
+): void {
+  const draw = (c: CanvasRenderingContext2D, ox: number, oy: number) => {
+    renderTileGrid(c, tileMap, ox, oy, zoom, tileColors, layoutCols);
+    // Carpet layer (above floor, below seat indicators / furniture / characters)
+    if (carpetTiles && carpetTiles.length > 0) {
+      renderCarpetLayer(c, carpetTiles, cols, rows, ox, oy, zoom);
+    }
+    // Area overlay (translucent color wash) — above carpets, below seat indicators
+    if (showAreas) {
+      renderAreaOverlay(c, areaTiles, areas, cols, rows, ox, oy, zoom, activeAreaLabel);
+    }
+  };
+
+  const s = TILE_SIZE * zoom;
+  const tmCols = tileMap.length > 0 ? tileMap[0].length : 0;
+  const width = (Math.max(cols, tmCols) + 2) * s;
+  const height = (Math.max(rows, tileMap.length) + 2) * s;
+  if (width * height > GROUND_LAYER_MAX_PIXELS) {
+    draw(ctx, offsetX, offsetY);
+    return;
+  }
+
+  const deps = [
+    tileMap,
+    tileColors,
+    layoutCols,
+    cols,
+    rows,
+    carpetTiles,
+    showAreas,
+    showAreas ? areas : null,
+    showAreas ? areaTiles : null,
+    showAreas ? activeAreaLabel : null,
+    zoom,
+    getFloorSpritesVersion(),
+    getCarpetSpritesVersion(),
+  ];
+  if (!groundLayer || !sameDeps(groundLayer.deps, deps)) {
+    const canvas = groundLayer?.canvas ?? document.createElement('canvas');
+    const lctx = canvas.getContext('2d')!;
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width; // resizing also clears
+      canvas.height = height;
+    } else {
+      lctx.clearRect(0, 0, width, height);
+    }
+    lctx.imageSmoothingEnabled = false;
+    draw(lctx, s, s);
+    groundLayer = { canvas, deps };
+  }
+  // offsetX/Y are integer device pixels → 1:1 blit, pixel-identical to direct drawing.
+  ctx.drawImage(groundLayer.canvas, offsetX - s, offsetY - s);
+}
+
+/** Wall instances only change with the tile map, wall colors or wall sprites. */
+function getCachedWallInstances(
+  tileMap: TileTypeVal[][],
+  tileColors: Array<ColorValue | null> | undefined,
+  layoutCols: number | undefined,
+): FurnitureInstance[] {
+  const deps = [tileMap, tileColors, layoutCols, getWallSpritesVersion()];
+  if (!wallInstanceCache || !sameDeps(wallInstanceCache.deps, deps)) {
+    wallInstanceCache = { instances: getWallInstances(tileMap, tileColors, layoutCols), deps };
+  }
+  return wallInstanceCache.instances;
 }
 
 interface ZDrawable {
@@ -882,18 +999,23 @@ export function renderFrame(
   // the DOM overlays so a label lands exactly on the sprite it belongs to.
   const { offsetX, offsetY } = mapOffset(canvasWidth, canvasHeight, cols, rows, zoom, panX, panY);
 
-  // Draw tiles (floor + wall base color)
-  renderTileGrid(ctx, tileMap, offsetX, offsetY, zoom, tileColors, layoutCols);
-
-  // Carpet layer (above floor, below seat indicators / furniture / characters)
-  if (carpetTiles && carpetTiles.length > 0) {
-    renderCarpetLayer(ctx, carpetTiles, cols, rows, offsetX, offsetY, zoom);
-  }
-
-  // Area overlay (translucent color wash) — above carpets, below seat indicators
-  if (showAreas) {
-    renderAreaOverlay(ctx, areaTiles, areas, cols, rows, offsetX, offsetY, zoom, activeAreaLabel);
-  }
+  // Draw tiles (floor + wall base color) + carpets + area wash, cached
+  renderGroundLayer(
+    ctx,
+    tileMap,
+    offsetX,
+    offsetY,
+    zoom,
+    tileColors,
+    layoutCols,
+    cols,
+    rows,
+    carpetTiles,
+    areas,
+    areaTiles,
+    showAreas,
+    activeAreaLabel,
+  );
 
   // Seat indicators (below furniture/characters, on top of floor)
   if (selection) {
@@ -910,7 +1032,9 @@ export function renderFrame(
   }
 
   // Build wall instances for z-sorting with furniture and characters
-  const wallInstances = hasWallSprites() ? getWallInstances(tileMap, tileColors, layoutCols) : [];
+  const wallInstances = hasWallSprites()
+    ? getCachedWallInstances(tileMap, tileColors, layoutCols)
+    : [];
   const allFurniture = wallInstances.length > 0 ? [...wallInstances, ...furniture] : furniture;
 
   // Draw walls + furniture + characters (z-sorted)

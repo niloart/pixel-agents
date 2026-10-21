@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { normalizeProjectPath } from '../../../../../core/src/normalizeProjectPath.js';
-import type { AgentEvent, HookProvider } from '../../../../../core/src/provider.js';
+import type { AgentEvent, HookProvider, ModelPricing } from '../../../../../core/src/provider.js';
 import {
   BASH_COMMAND_DISPLAY_MAX_LENGTH,
   TASK_DESCRIPTION_DISPLAY_MAX_LENGTH,
@@ -16,7 +16,10 @@ import {
 import { claudeTeamProvider } from './claudeTeamProvider.js';
 import { CONSENT_DISCLOSURE, CONSENT_INSTALL_HEADLINE } from './consentCopy.js';
 import {
+  CACHE_WRITE_1H_MULTIPLIER,
+  CACHE_WRITE_5M_MULTIPLIER,
   CLAUDE_LARGE_CONTEXT_WINDOW,
+  CLAUDE_PRICING,
   CLAUDE_SMALL_CONTEXT_MODEL_PATTERN,
   CLAUDE_SMALL_CONTEXT_WINDOW,
   CLAUDE_TERMINAL_NAME_PREFIX,
@@ -288,6 +291,21 @@ export function contextWindowForModel(model: string | undefined): number | undef
     : CLAUDE_LARGE_CONTEXT_WINDOW;
 }
 
+/** List price for a Claude model id, or undefined for one not in the table. */
+export function pricingForModel(model: string | undefined): ModelPricing | undefined {
+  if (!model) return undefined;
+  const row = CLAUDE_PRICING.find(([fragment]) => model.includes(fragment));
+  if (!row) return undefined;
+  const [, input, output, cacheRead] = row;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite5m: input * CACHE_WRITE_5M_MULTIPLIER,
+    cacheWrite1h: input * CACHE_WRITE_1H_MULTIPLIER,
+  };
+}
+
 // ── The provider ──
 
 export const claudeProvider: HookProvider = {
@@ -305,10 +323,15 @@ export const claudeProvider: HookProvider = {
 
   formatToolStatus,
   permissionExemptTools: new Set(['Task', 'Agent', 'AskUserQuestion']),
+  userInputTools: new Set(['AskUserQuestion', 'ExitPlanMode']),
+  // `auto` approves through a classifier and `bypassPermissions` never asks;
+  // `default`, `acceptEdits` and `plan` can still stop on a tool.
+  promptFreeModes: new Set(['auto', 'bypassPermissions']),
   subagentToolNames: new Set(['Task', 'Agent']),
   readingTools: new Set(['Read', 'Grep', 'Glob', 'WebFetch', 'WebSearch']),
   terminalNamePrefix: CLAUDE_TERMINAL_NAME_PREFIX,
   contextWindowForModel,
+  pricingForModel,
 
   getSessionDirs,
   getAllSessionRoots,

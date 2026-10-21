@@ -1,6 +1,6 @@
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { claudeTeamProvider } from '../src/providers/hook/claude/claudeTeamProvider.js';
 
@@ -388,20 +388,28 @@ describe('claudeTeamProvider', () => {
   });
 
   describe('getTeamMembers', () => {
-    // Writes under ~/.claude/teams/<TEAM_NAME>/ and cleans up in afterEach.
+    // Writes under ~/.claude/teams/<TEAM_NAME>/ with home redirected to a temp dir
+    // (HOME for POSIX, USERPROFILE for Windows' os.homedir()).
     const fs = require('fs') as typeof import('fs');
     const TEAM_NAME = 'test-team-' + Date.now();
+    let tempHome: string;
+    let originalHome: string | undefined;
+    let originalUserProfile: string | undefined;
+
+    beforeEach(() => {
+      tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'pxl-team-members-'));
+      originalHome = process.env.HOME;
+      originalUserProfile = process.env.USERPROFILE;
+      process.env.HOME = tempHome;
+      process.env.USERPROFILE = tempHome;
+    });
 
     afterEach(() => {
-      // Cleanup any test artifacts
-      try {
-        fs.rmSync(path.join(os.homedir(), '.claude', 'teams', TEAM_NAME), {
-          recursive: true,
-          force: true,
-        });
-      } catch {
-        /* ignore */
-      }
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+      if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = originalUserProfile;
+      fs.rmSync(tempHome, { recursive: true, force: true });
     });
 
     it('returns null when the team config does not exist', () => {

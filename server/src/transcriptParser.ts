@@ -1,9 +1,9 @@
-const debug = process.env.PIXEL_AGENTS_DEBUG !== '0';
+const debug = process.env.PIXEL_AGENTS_DEBUG === '1';
 
 import type { HookProvider } from '../../core/src/provider.js';
 import type { AgentStateStore } from './agentStateStore.js';
 import { TEXT_IDLE_DELAY_MS, TOOL_DONE_DELAY_MS } from './constants.js';
-import { updateContextUsage } from './contextUsage.js';
+import { isInterruptRecord, promptText, updateContextUsage } from './contextUsage.js';
 import { hasInlineTeammates, hasPromotedBackgroundAgent } from './teamUtils.js';
 import {
   cancelPermissionTimer,
@@ -26,7 +26,43 @@ function exemptTools(): ReadonlySet<string> {
   return hookProvider?.permissionExemptTools ?? EMPTY_EXEMPT_TOOLS;
 }
 
+/**
+ * Can this open tool mean the agent is waiting on the user? A tool that asks
+ * (a question, a plan to approve) always can. Any other non-exempt tool only
+ * when the session's permission mode can prompt at all -- in a prompt-free
+ * mode a tool that runs past the permission timer is simply slow.
+ */
+function mayWaitOnUser(agent: AgentState, toolName: string): boolean {
+  if (hookProvider?.userInputTools?.has(toolName)) return true;
+  if (agent.permissionMode && hookProvider?.promptFreeModes?.has(agent.permissionMode)) {
+    return false;
+  }
+  return !exemptTools().has(toolName);
+}
+
 /** Whether the given tool name spawns a sub-agent according to the active provider. */
+/**
+ * Waiting on the user for a turn end no hook reports (interrupt, local
+ * command), so it's broadcast even when hooks are on.
+ */
+function announceWait(
+  agentId: number,
+  agent: AgentState,
+  agents: AgentStateStore,
+  since: number,
+): void {
+  agent.isWaiting = true;
+  agent.waitingSince = since;
+  agents.broadcast({
+    type: 'agentStatus',
+    id: agentId,
+    status: 'waiting',
+    since,
+    prompt: agent.lastPrompt,
+    awaitingInput: false,
+  });
+}
+
 function isSubagentTool(toolName: string | null | undefined): boolean {
   if (!toolName || !hookProvider) return false;
   return hookProvider.subagentToolNames.has(toolName);
@@ -101,9 +137,13 @@ export function processTranscriptLine(
   if (!agent) return;
   agent.lastDataAt = Date.now();
   agent.linesProcessed++;
+  let record: any; // schemaless JSONL record
   try {
-    const record = JSON.parse(line);
-
+    record = JSON.parse(line);
+  } catch {
+    return; // Ignore malformed lines
+  }
+  try {
     // -- Agent Teams: extract team metadata via the active provider --
     // The provider reads its CLI's own field names (Claude: record.teamName + record.agentName).
     // Other CLIs would implement this differently or not at all.
@@ -134,6 +174,8 @@ export function processTranscriptLine(
 
     // -- Context window usage (drives every agent's context gauge) --
     updateContextUsage(agentId, agent, agents, record, hookProvider);
+    agent.lastPrompt = promptText(record) ?? agent.lastPrompt;
+    if (typeof record.permissionMode === 'string') agent.permissionMode = record.permissionMode;
 
     // Resilient content extraction: support both record.message.content and record.content
     // Claude Code may change the JSONL structure across versions
@@ -164,7 +206,7 @@ export function processTranscriptLine(
             agent.activeToolIds.add(block.id);
             agent.activeToolStatuses.set(block.id, status);
             agent.activeToolNames.set(block.id, toolName);
-            if (!exemptTools().has(toolName)) {
+            if (mayWaitOnUser(agent, toolName)) {
               hasNonExemptTool = true;
             }
             // Detect tmux vs inline team mode from the team provider's spawn predicate.
@@ -235,7 +277,9 @@ export function processTranscriptLine(
         // produces false positives. Permission on teammates comes from the lead's
         // routed Notification(permission_prompt) hook — slower but accurate.
         if (hasNonExemptTool && !agent.hookDelivered && !agent.leadAgentId) {
-          startPermissionTimer(agentId, agents, permissionTimers, exemptTools());
+          startPermissionTimer(agentId, agents, permissionTimers, (name) =>
+            mayWaitOnUser(agent, name),
+          );
         }
       } else if (blocks.some((b) => b.type === 'text') && !agent.hadToolsInTurn) {
         // Text-only response in a turn that hasn't used any tools.
@@ -400,6 +444,10 @@ export function processTranscriptLine(
           cancelWaitingTimer(agentId, waitingTimers);
           clearAgentActivity(agent, agentId, agents, permissionTimers);
           agent.hadToolsInTurn = false;
+          // ...unless it's an interrupt: that ends the turn, and nothing else will say so.
+          if (isInterruptRecord(record)) {
+            announceWait(agentId, agent, agents, Date.parse(record.timestamp ?? '') || Date.now());
+          }
         }
       } else if (typeof content === 'string' && content.trim()) {
         // New user text prompt — new turn starting
@@ -444,7 +492,13 @@ export function processTranscriptLine(
           }
         }
       }
-    } else if (record.type === 'system' && record.subtype === 'turn_duration') {
+    } else if (
+      record.type === 'system' &&
+      (record.subtype === 'turn_duration' ||
+        // Claude Desktop never writes turn_duration; its turn end is the Stop
+        // hook summary it records after every main-chain turn.
+        (record.subtype === 'stop_hook_summary' && record.isSidechain !== true))
+    ) {
       cancelWaitingTimer(agentId, waitingTimers);
       cancelPermissionTimer(agentId, permissionTimers);
 
@@ -502,18 +556,38 @@ export function processTranscriptLine(
         }
       }
 
-      agent.isWaiting = true;
       agent.permissionSent = false;
       agent.hadToolsInTurn = false;
-      // Skip status post when hooks already handled it
-      if (!agent.hookDelivered) {
+      // A slow Stop hook can let the text-idle timer announce the wait first;
+      // don't announce it twice. With hooks on, the Stop hook owns the wait and
+      // its `since`: marking it here silently would make markAgentWaiting skip
+      // it as already announced.
+      if (!agent.hookDelivered && !agent.isWaiting) {
+        agent.isWaiting = true;
+        agent.waitingSince = Date.parse(record.timestamp) || Date.now();
         agents.broadcast({
           type: 'agentStatus',
           id: agentId,
           status: 'waiting',
+          since: agent.waitingSince,
+          prompt: agent.lastPrompt,
           // turn_duration = the turn completed, so this is "Done".
           awaitingInput: false,
         });
+      }
+    } else if (record.type === 'system' && record.subtype === 'local_command') {
+      // A local slash command (/context, /cost, /model...) never reaches the
+      // model: no turn runs, no Stop fires, so the "new prompt" its user record
+      // triggered would leave the agent active for good. Put the wait back with
+      // its old `since`, so an inbox "seen" mark still holds. Broadcast even with
+      // hooks on -- no hook will.
+      if (!agent.isWaiting && agent.activeToolIds.size === 0) {
+        announceWait(
+          agentId,
+          agent,
+          agents,
+          agent.waitingSince ?? (Date.parse(record.timestamp ?? '') || Date.now()),
+        );
       }
     } else if (record.type && !agent.seenUnknownRecordTypes.has(record.type)) {
       // Log first occurrence of unrecognized record types to help diagnose issues
@@ -530,8 +604,8 @@ export function processTranscriptLine(
         }
       }
     }
-  } catch {
-    // Ignore malformed lines
+  } catch (err) {
+    console.error(`[Pixel Agents] JSONL: Agent ${agentId} - failed to process record:`, err);
   }
 }
 
@@ -557,7 +631,7 @@ function processProgressRecord(
   const dataType = data.type as string | undefined;
   if (dataType === 'bash_progress' || dataType === 'mcp_progress') {
     if (agent.activeToolIds.has(parentToolId) && !agent.hookDelivered && !agent.leadAgentId) {
-      startPermissionTimer(agentId, agents, permissionTimers, exemptTools());
+      startPermissionTimer(agentId, agents, permissionTimers, (name) => mayWaitOnUser(agent, name));
     }
     return;
   }
@@ -600,7 +674,7 @@ function processProgressRecord(
         }
         subNames.set(block.id, toolName);
 
-        if (!exemptTools().has(toolName)) {
+        if (mayWaitOnUser(agent, toolName)) {
           hasNonExemptSubTool = true;
         }
 
@@ -614,7 +688,7 @@ function processProgressRecord(
       }
     }
     if (hasNonExemptSubTool && !agent.hookDelivered) {
-      startPermissionTimer(agentId, agents, permissionTimers, exemptTools());
+      startPermissionTimer(agentId, agents, permissionTimers, (name) => mayWaitOnUser(agent, name));
     }
   } else if (msgType === 'user') {
     for (const block of content) {
@@ -649,7 +723,7 @@ function processProgressRecord(
     let stillHasNonExempt = false;
     for (const [, subNames] of agent.activeSubagentToolNames) {
       for (const [, toolName] of subNames) {
-        if (!exemptTools().has(toolName)) {
+        if (mayWaitOnUser(agent, toolName)) {
           stillHasNonExempt = true;
           break;
         }
@@ -657,7 +731,7 @@ function processProgressRecord(
       if (stillHasNonExempt) break;
     }
     if (stillHasNonExempt && !agent.hookDelivered) {
-      startPermissionTimer(agentId, agents, permissionTimers, exemptTools());
+      startPermissionTimer(agentId, agents, permissionTimers, (name) => mayWaitOnUser(agent, name));
     }
   }
 }

@@ -45,7 +45,9 @@ export const CONTEXT_SEED_TAIL_BYTES = 256 * 1024;
 /** Only adopt global JSONL files larger than this (filters out empty/init-only sessions) */
 export const GLOBAL_SCAN_ACTIVE_MIN_SIZE = 3_072; // 3KB
 /** Only adopt global JSONL files modified within this window */
-export const GLOBAL_SCAN_ACTIVE_MAX_AGE_MS = 600_000; // 10 minutes
+// ponytail: narrowed from 24h so only recently active sessions show up; widen if
+// you want stale-but-unread conversations surfaced again.
+export const GLOBAL_SCAN_ACTIVE_MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
 
 // ── Directory Suggestions ───────────────────────────────────
 /** How much of a session transcript is read to recover the working directory it
@@ -174,3 +176,9 @@ export const PALETTE_COUNT = 6;
  *  clientMessageHandler to guard saveAgentSeats payloads from a remote or
  *  hand-edited source corrupting the stored values with out-of-range values. */
 export const HUE_SHIFT_MAX_DEG = 360;
+
+// ── Plan limits (server/src/planUsage.ts) ───────────────────
+/** How often the account's plan limits are re-read. They move by single
+ *  percents over minutes; faster polling only spends requests. */
+export const PLAN_USAGE_POLL_MS = 120_000;
+export const PLAN_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';

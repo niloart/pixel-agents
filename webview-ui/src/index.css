@@ -55,6 +55,8 @@
   --spacing: 1px;
 
   --font-pixel: 'FS Pixel Sans', sans-serif;
+  /* Dense reading text (inbox): the pixel font tires the eye at length */
+  --font-ui: system-ui, 'Segoe UI', sans-serif;
 
   /* Text sizes (pixel-art scale, base = 22px) */
   --text-*: initial;
@@ -118,6 +120,12 @@
   /* Panel with standard pixel-art border + shadow */
   .pixel-panel {
     @apply bg-bg border-2 border-border rounded-none shadow-pixel;
+  }
+
+  /* Beats the base-layer `* { font-pixel }` for everything inside */
+  .font-ui-all,
+  .font-ui-all * {
+    @apply font-ui;
   }
 
   /* Horizontal carousel for editor items */

@@ -8,6 +8,8 @@ import { ConnectionIndicator } from './components/ConnectionIndicator.js';
 import { DebugView } from './components/DebugView.js';
 import { DirectoryModal } from './components/DirectoryModal.js';
 import { EditActionBar } from './components/EditActionBar.js';
+import { InboxPanel } from './components/InboxPanel.js';
+import { canSendOffOnSeen } from './components/inboxSeen.js';
 import { IntroBubble } from './components/IntroBubble.js';
 import { MigrationNotice } from './components/MigrationNotice.js';
 import { SettingsModal } from './components/SettingsModal.js';
@@ -17,7 +19,7 @@ import { Button } from './components/ui/Button.js';
 import { Modal } from './components/ui/Modal.js';
 import { VersionIndicator } from './components/VersionIndicator.js';
 import { ZoomControls } from './components/ZoomControls.js';
-import { OFFICE_CANVAS_TEST_ID } from './constants.js';
+import { OFFICE_CANVAS_TEST_ID, TERMINAL_SIDEBAR_WIDTH_PX } from './constants.js';
 import { useDirectoryEditor } from './hooks/useDirectoryEditor.js';
 import { useEditorActions } from './hooks/useEditorActions.js';
 import { useEditorKeyboard } from './hooks/useEditorKeyboard.js';
@@ -48,6 +50,11 @@ import { transport } from './transport/index.js';
 const officeStateRef = { current: null as OfficeState | null };
 const editorState = new EditorState();
 
+// Reads the imperative editor state, not React state: useExtensionMessages
+// subscribes its listener once, so a closure over render-time values would
+// stay frozen at the first render (never dirty) and the guard would never fire.
+const isEditDirty = () => editorState.isEditMode && editorState.isDirty;
+
 // Test-only observability hooks (message/sound logs, addAgent wrapper, selectAgent).
 // Installed only under the e2e harness so they never patch prototypes or grow
 // unbounded logs in a real user's session.
@@ -74,11 +81,6 @@ function App() {
 
   const editor = useEditorActions(getOfficeState, editorState);
 
-  const isEditDirty = useCallback(
-    () => editor.isEditMode && editor.isDirty,
-    [editor.isEditMode, editor.isDirty],
-  );
-
   const {
     agents,
     selectedAgent,
@@ -86,6 +88,9 @@ function App() {
     agentStatuses,
     agentAwaitingInput,
     agentSeenActivity,
+    waitingInfo,
+    tokenSpend,
+    planUsage,
     subagentTools,
     subagentCharacters,
     layoutReady,
@@ -281,13 +286,14 @@ function App() {
   // pixel→tile geometry — the handlers still own undo/dirty/rebuild; for specs
   // that drive the real canvas gesture instead, getTileCenter projects a tile
   // to canvas CSS pixels with the renderer's own zoom + pan. Guarded on isE2E.
+  const { handleEditorTileAction, handleEditorEraseAction, handleDrop } = editor;
   useEffect(() => {
     if (!isE2E || typeof window === 'undefined') return;
     const hooks = (window.__pixelAgentsTestHooks ??= {});
-    hooks.editorTileAction = (col, row) => editor.handleEditorTileAction(col, row);
-    hooks.editorEraseAction = (col, row) => editor.handleEditorEraseAction(col, row);
+    hooks.editorTileAction = (col, row) => handleEditorTileAction(col, row);
+    hooks.editorEraseAction = (col, row) => handleEditorEraseAction(col, row);
     hooks.editorDrop = (uid, col, row, duplicate = false) =>
-      editor.handleDrop(uid, col, row, { duplicate });
+      handleDrop(uid, col, row, { duplicate });
     hooks.getTileCenter = (col, row) => {
       const canvas = document.querySelector(`[data-testid="${OFFICE_CANVAS_TEST_ID}"]`);
       if (!canvas) return null;
@@ -305,9 +311,9 @@ function App() {
     };
     hooks.getShowAreas = () => effectiveShowAreas;
   }, [
-    editor.handleEditorTileAction,
-    editor.handleEditorEraseAction,
-    editor.handleDrop,
+    handleEditorTileAction,
+    handleEditorEraseAction,
+    handleDrop,
     editor.zoom,
     editor.panRef,
     effectiveShowAreas,
@@ -434,7 +440,7 @@ function App() {
       };
       reader.readAsText(file);
     },
-    [isEditDirty, editor],
+    [editor],
   );
 
   // Force dependency on editorTickForKeyboard to propagate keyboard-triggered re-renders
@@ -497,6 +503,32 @@ function App() {
           {/* Mobile: pinch replaces the zoom buttons, and the toolbar's
                 jobs move to the card bar (+) and the floating Settings button. */}
           {!isMobile && <ZoomControls zoom={editor.zoom} onZoomChange={editor.handleZoomChange} />}
+
+          <InboxPanel
+            agents={agents}
+            agentTools={agentTools}
+            waitingInfo={waitingInfo}
+            tokenSpend={tokenSpend}
+            planUsage={planUsage}
+            folderNameOf={(id) => officeState.characters.get(id)?.directoryName}
+            rightPx={isMobile ? 8 : TERMINAL_SIDEBAR_WIDTH_PX + 8}
+            isActive={(id) => officeState.characters.get(id)?.isActive ?? false}
+            onSelect={(id) => {
+              officeState.selectedAgentId = id;
+              officeState.cameraFollowId = id;
+            }}
+            onDismiss={(id) => {
+              if (
+                canSendOffOnSeen(
+                  officeState.characters.get(id),
+                  isBrowserRuntime,
+                  terminalAgentIds.includes(id),
+                )
+              ) {
+                transport.send({ type: 'closeAgent', id });
+              }
+            }}
+          />
 
           {/* Vignette overlay */}
           <div

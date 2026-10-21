@@ -1,4 +1,5 @@
 import type { AgentStateStore } from './agentStateStore.js';
+import { contextUsageMessage } from './contextUsage.js';
 import { hasPromotedBackgroundAgent } from './teamUtils.js';
 
 /**
@@ -72,17 +73,14 @@ export function resendAgentActivity(
         type: 'agentStatus',
         id,
         status: 'waiting',
+        since: agent.waitingSince,
+        prompt: agent.lastPrompt,
       });
     }
 
     // 5. Context usage
-    if (agent.contextTokens > 0) {
-      send({
-        type: 'agentContextUsage',
-        id,
-        contextTokens: agent.contextTokens,
-        maxContextTokens: agent.maxContextTokens,
-      });
+    if (agent.contextTokens > 0 || agent.totalTokens) {
+      send(contextUsageMessage(id, agent));
     }
   }
 }

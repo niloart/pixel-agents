@@ -6,6 +6,8 @@ import { defineConfig } from 'vitest/config';
 process.env['ALLURE_LABEL_epic'] ??= 'webview';
 
 const rootDir = path.dirname(fileURLToPath(import.meta.url));
+// Allure only in CI: locally it writes hundreds of result files per run and nothing cleans them.
+const allure = !!process.env.CI;
 
 export default defineConfig({
   test: {
@@ -16,15 +18,17 @@ export default defineConfig({
     // global `window.postMessage` listener in browser-transport. Serial run
     // avoids port collisions and listener crosstalk.
     fileParallelism: false,
-    setupFiles: ['allure-vitest/setup'],
-    reporters: [
-      'default',
-      [
-        'allure-vitest/reporter',
-        {
-          resultsDir: path.resolve(rootDir, '../allure-results/webview'),
-        },
-      ],
-    ],
+    setupFiles: allure ? ['allure-vitest/setup'] : [],
+    reporters: allure
+      ? [
+          'default',
+          [
+            'allure-vitest/reporter',
+            {
+              resultsDir: path.resolve(rootDir, '../allure-results/webview'),
+            },
+          ],
+        ]
+      : ['default'],
   },
 });

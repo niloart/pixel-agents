@@ -85,3 +85,28 @@ export const CLAUDE_SMALL_CONTEXT_WINDOW = 200_000;
  *  guessing small for a large model pins every gauge in the red, while the
  *  reverse is a quiet under-read that the runtime's widening still corrects. */
 export const CLAUDE_SMALL_CONTEXT_MODEL_PATTERN = /haiku|claude-[123]|-4-[01]\b/i;
+
+// ── Pricing ──
+
+// Anthropic API list prices, USD per million tokens (as of 2026-09-25).
+// [id fragment, input, output, cache read]. Cache writes derive from input:
+// 1.25x for the 5-minute TTL, 2x for the 1-hour TTL (Claude Code's default).
+// First match wins, so a longer id must precede its prefix (opus-5-5 before
+// opus-5). Older models are left out on purpose -- no price beats a wrong one.
+export const CLAUDE_PRICING: readonly (readonly [string, number, number, number])[] = [
+  ['fable-5-1', 10, 50, 0.25],
+  ['mythos-5-1', 10, 50, 0.25],
+  ['fable-5', 10, 50, 1],
+  ['mythos-5', 10, 50, 1],
+  ['opus-5-5', 4, 20, 0.2],
+  ['opus-5', 5, 25, 0.5],
+  ['opus-4-8', 5, 25, 0.5],
+  ['opus-4-7', 5, 25, 0.5],
+  ['opus-4-6', 5, 25, 0.5],
+  ['sonnet-5-5', 2, 10, 0.2],
+  ['sonnet-5', 2, 10, 0.2],
+  ['sonnet-4-6', 3, 15, 0.3],
+  ['haiku-4-5', 1, 5, 0.1],
+];
+export const CACHE_WRITE_5M_MULTIPLIER = 1.25;
+export const CACHE_WRITE_1H_MULTIPLIER = 2;

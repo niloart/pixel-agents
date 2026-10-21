@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-import type { HooksConsentRequest } from '../../../core/src/messages.js';
-import { playDoneSound, playPermissionSound, setSoundEnabled } from '../notificationSound.js';
+import type {
+  AgentContextUsage,
+  HooksConsentRequest,
+  PlanUsage,
+} from '../../../core/src/messages.js';
+import { INBOX_FRESH_WAIT_MS } from '../constants.js';
+import {
+  notifyApproval,
+  playDoneSound,
+  playPermissionSound,
+  setSoundEnabled,
+} from '../notificationSound.js';
 import type { ExistingAgentMeta, PendingAgent } from '../office/engine/existingAgents.js';
 import { reconcileExistingAgents } from '../office/engine/existingAgents.js';
 import type { OfficeState } from '../office/engine/officeState.js';
@@ -96,6 +106,12 @@ interface ExtensionMessageState {
   agentAwaitingInput: Record<number, boolean>;
   /** Latch: true once an agent has had any activity (first tool or status). */
   agentSeenActivity: Record<number, boolean>;
+  /** Per waiting agent: when the wait began and the prompt it answered (inbox). */
+  waitingInfo: Record<number, WaitingInfo>;
+  /** What each conversation has spent so far: tokens per counter and cost. */
+  tokenSpend: Record<number, AgentContextUsage>;
+  /** Account plan limits (5h / weekly / per-model), null until the first poll. */
+  planUsage: PlanUsage | null;
   subagentTools: Record<number, Record<string, ToolActivity[]>>;
   subagentCharacters: SubagentCharacter[];
   layoutReady: boolean;
@@ -168,6 +184,11 @@ function omitKey<T>(record: Record<number, T>, id: number): Record<number, T> {
   return next;
 }
 
+export interface WaitingInfo {
+  since: number;
+  prompt?: string;
+}
+
 function saveAgentSeats(os: OfficeState): void {
   transport.send({ type: 'saveAgentSeats', seats: os.getPersistableSeats() });
 }
@@ -185,6 +206,9 @@ export function useExtensionMessages(
   const [agentSeenActivity, setAgentSeenActivity] = useState<Record<number, boolean>>({});
   const markSeenActivity = (id: number) =>
     setAgentSeenActivity((prev) => (prev[id] ? prev : { ...prev, [id]: true }));
+  const [waitingInfo, setWaitingInfo] = useState<Record<number, WaitingInfo>>({});
+  const [tokenSpend, setTokenSpend] = useState<Record<number, AgentContextUsage>>({});
+  const [planUsage, setPlanUsage] = useState<PlanUsage | null>(null);
   const [subagentTools, setSubagentTools] = useState<
     Record<number, Record<string, ToolActivity[]>>
   >({});
@@ -401,6 +425,8 @@ export function useExtensionMessages(
         setAgentAwaitingInput((prev) => omitKey(prev, id));
         setAgentSeenActivity((prev) => omitKey(prev, id));
         setSubagentTools((prev) => omitKey(prev, id));
+        setWaitingInfo((prev) => omitKey(prev, id));
+        setTokenSpend((prev) => omitKey(prev, id));
         // Remove all sub-agent characters belonging to this agent
         delete backgroundParentToolIdsRef.current[id];
         os.removeAllSubagents(id);
@@ -560,8 +586,15 @@ export function useExtensionMessages(
         const id = msg.id as number;
         const status = msg.status as string;
         markSeenActivity(id);
+        const wasActive = os.characters.get(id)?.isActive === true;
         setAgentStatuses((prev) => {
-          if (status === 'active') return omitKey(prev, id);
+          if (status === 'active') {
+            // A new object even when id is absent if isActive is about to flip:
+            // the inbox reads the character's isActive, which lives outside
+            // React, and needs this render to see it. Otherwise nothing changed.
+            if (!(id in prev) && wasActive) return prev;
+            return omitKey(prev, id);
+          }
           return { ...prev, [id]: status };
         });
         setAgentAwaitingInput((prev) => {
@@ -570,9 +603,21 @@ export function useExtensionMessages(
           return { ...prev, [id]: awaiting };
         });
         os.setAgentActive(id, status === 'active');
+        const since = typeof msg.since === 'number' ? msg.since : Date.now();
+        setWaitingInfo((prev) => {
+          if (status !== 'waiting') {
+            if (!(id in prev)) return prev;
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          }
+          return { ...prev, [id]: { since, prompt: msg.prompt as string | undefined } };
+        });
         if (status === 'waiting') {
           os.showWaitingBubble(id, msg.awaitingInput === true);
-          playDoneSound();
+          // A wait that began long ago is a conversation found on connect or
+          // adoption, not one that just finished -- a dozen of those must not chime.
+          if (Date.now() - since < INBOX_FRESH_WAIT_MS) playDoneSound();
         }
       } else if (msg.type === 'agentToolPermission') {
         const id = msg.id as number;
@@ -586,6 +631,7 @@ export function useExtensionMessages(
         });
         os.showPermissionBubble(id);
         playPermissionSound();
+        notifyApproval(os.characters.get(id)?.directoryName);
       } else if (msg.type === 'subagentToolPermission') {
         const id = msg.id as number;
         const parentToolId = msg.parentToolId as string;
@@ -844,6 +890,14 @@ export function useExtensionMessages(
       } else if (msg.type === 'agentContextUsage') {
         const id = msg.id as number;
         os.setAgentContext(id, msg.contextTokens as number, msg.maxContextTokens as number);
+        if (typeof msg.totalTokens === 'number') {
+          const usage = msg as AgentContextUsage;
+          setTokenSpend((prev) =>
+            prev[id]?.totalTokens === usage.totalTokens ? prev : { ...prev, [id]: usage },
+          );
+        }
+      } else if (msg.type === 'planUsage') {
+        setPlanUsage(msg as PlanUsage);
       }
     };
     const unsubscribe = transport.onMessage(handler);
@@ -874,6 +928,9 @@ export function useExtensionMessages(
     agentStatuses,
     agentAwaitingInput,
     agentSeenActivity,
+    waitingInfo,
+    tokenSpend,
+    planUsage,
     subagentTools,
     subagentCharacters,
     layoutReady,

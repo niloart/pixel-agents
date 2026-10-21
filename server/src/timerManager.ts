@@ -81,11 +81,14 @@ export function startWaitingTimer(
     const agent = agents.get(agentId);
     if (agent) {
       agent.isWaiting = true;
+      agent.waitingSince = Date.now();
     }
     agents.broadcast({
       type: 'agentStatus',
       id: agentId,
       status: 'waiting',
+      since: agent?.waitingSince,
+      prompt: agent?.lastPrompt,
       // Heuristic text-idle timer: the turn ended without a clear idle signal,
       // so this is "Done", not "Waiting for input".
       awaitingInput: false,
@@ -109,7 +112,7 @@ export function startPermissionTimer(
   agentId: number,
   agents: AgentStateStore,
   permissionTimers: Map<number, ReturnType<typeof setTimeout>>,
-  permissionExemptTools: ReadonlySet<string>,
+  mayWaitOnUser: (toolName: string) => boolean,
 ): void {
   cancelPermissionTimer(agentId, permissionTimers);
   const timer = setTimeout(() => {
@@ -117,11 +120,11 @@ export function startPermissionTimer(
     const agent = agents.get(agentId);
     if (!agent) return;
 
-    // Only flag if there are still active non-exempt tools (parent or sub-agent)
+    // Only flag if a still-open tool may be waiting on the user (parent or sub-agent)
     let hasNonExempt = false;
     for (const toolId of agent.activeToolIds) {
       const toolName = agent.activeToolNames.get(toolId);
-      if (!permissionExemptTools.has(toolName || '')) {
+      if (mayWaitOnUser(toolName || '')) {
         hasNonExempt = true;
         break;
       }
@@ -131,7 +134,7 @@ export function startPermissionTimer(
     const stuckSubagentParentToolIds: string[] = [];
     for (const [parentToolId, subToolNames] of agent.activeSubagentToolNames) {
       for (const [, toolName] of subToolNames) {
-        if (!permissionExemptTools.has(toolName)) {
+        if (mayWaitOnUser(toolName)) {
           stuckSubagentParentToolIds.push(parentToolId);
           hasNonExempt = true;
           break;

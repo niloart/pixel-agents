@@ -125,13 +125,22 @@ export function ToolOverlay({
   const [, setTick] = useState(0);
   useEffect(() => {
     let rafId = 0;
+    let wasShown = false;
     const tick = () => {
-      setTick((n) => n + 1);
+      // Labels track moving characters, so re-render every frame — but only
+      // while one can be visible (plus one frame after, to clear the last one).
+      // Hover/selection live on officeState (not React state), hence the poll.
+      const shown =
+        alwaysShowOverlay ||
+        officeState.selectedAgentId !== null ||
+        officeState.hoveredAgentId !== null;
+      if (shown || wasShown) setTick((n) => n + 1);
+      wasShown = shown;
       rafId = requestAnimationFrame(tick);
     };
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
-  }, []);
+  }, [alwaysShowOverlay, officeState]);
 
   const el = containerRef.current;
   if (!el) return null;

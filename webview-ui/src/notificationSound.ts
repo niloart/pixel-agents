@@ -125,3 +125,15 @@ export function unlockAudio(): void {
     // ignore
   }
 }
+
+/** System notification for a conversation waiting on an approval. Skipped while
+ *  this tab has focus (the bubble and chime already say it) and until the user
+ *  allows notifications from the inbox. */
+export function notifyApproval(folderName: string | undefined): void {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  if (document.hasFocus()) return;
+  new Notification('Pixel Agents', {
+    body: `${folderName ?? 'Uma conversa'} precisa da sua aprovação`,
+    tag: `approval:${folderName ?? ''}`,
+  });
+}

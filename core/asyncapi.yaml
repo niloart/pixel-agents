@@ -100,6 +100,8 @@ components:
         - $ref: '#/components/schemas/AgentTeamInfo'
         # Context window
         - $ref: '#/components/schemas/AgentContextUsage'
+        # Plan limits
+        - $ref: '#/components/schemas/PlanUsage'
         # Layout
         - $ref: '#/components/schemas/LayoutLoaded'
         # Assets
@@ -275,6 +277,17 @@ components:
             Only meaningful when status is "waiting". True when the agent went
             idle waiting on the user (drives the "Waiting for input" label);
             absent/false means the agent finished its turn ("Done").
+        since:
+          type: number
+          description: >-
+            Only meaningful when status is "waiting". When the wait began (ms
+            since epoch) -- the turn-end record's own timestamp when known, so a
+            conversation that answered hours ago reports that, not "now".
+        prompt:
+          type: string
+          description: >-
+            Only meaningful when status is "waiting". First line of the user's
+            latest prompt -- what the conversation is about.
 
     AgentActivityStatus:
       description: Activity state of an agent.
@@ -455,6 +468,67 @@ components:
           type: integer
         maxContextTokens:
           type: integer
+        totalTokens:
+          type: integer
+          description: >-
+            Tokens the conversation has spent so far, summed over every response
+            (input + cache + output, each response counted once). Unlike
+            contextTokens this only grows.
+        inputTokens:
+          type: integer
+          description: Uncached prompt tokens within totalTokens.
+        cacheWriteTokens:
+          type: integer
+          description: Prompt tokens written to the cache within totalTokens.
+        cacheReadTokens:
+          type: integer
+          description: >-
+            Prompt tokens read from the cache within totalTokens -- usually most
+            of it, and the cheapest kind.
+        outputTokens:
+          type: integer
+          description: Tokens the model wrote within totalTokens.
+        costUsd:
+          type: number
+          description: >-
+            What totalTokens would cost at API list prices, in USD. Absent when
+            any response came from a model the provider can't price.
+
+    PlanUsage:
+      description: |
+        The account's plan limits -- the windows Claude's own usage card shows
+        (5-hour session, weekly, per-model weekly). Polled by the server; an
+        empty `windows` with `error` means they couldn't be read right now.
+      type: object
+      additionalProperties: false
+      required: [type, windows]
+      properties:
+        type:
+          const: planUsage
+        windows:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlanUsageWindow'
+        error:
+          type: string
+
+    PlanUsageWindow:
+      description: One plan limit window.
+      type: object
+      additionalProperties: false
+      required: [kind, percent]
+      properties:
+        kind:
+          type: string
+          description: '"session" (5-hour), "weekly" (all models) or "weekly_model".'
+        model:
+          type: string
+          description: Model the window is scoped to (weekly_model only), e.g. "Fable".
+        percent:
+          type: number
+        resetsAt:
+          type: number
+          description: When the window resets (ms since epoch).
 
     LayoutLoaded:
       description: |

@@ -1,5 +1,13 @@
 import type * as vscode from 'vscode';
 
+export interface TokenSpend {
+  inputTokens: number;
+  cacheWriteTokens: number;
+  cacheReadTokens: number;
+  outputTokens: number;
+  costUsd: number | null;
+}
+
 export interface AgentState {
   id: number;
   sessionId: string;
@@ -18,6 +26,14 @@ export interface AgentState {
   activeSubagentToolNames: Map<string, Map<string, string>>; // parentToolId → (subToolId → toolName)
   backgroundAgentToolIds: Set<string>; // tool IDs for run_in_background Agent calls (stay alive until queue-operation)
   isWaiting: boolean;
+  /** When the current wait began (ms since epoch) -- the turn-end record's
+   *  timestamp when known, so a conversation found hours later says so. */
+  waitingSince?: number;
+  /** First line of the user's latest prompt -- what the conversation is about,
+   *  for an inbox that has to remind you why you opened it. */
+  lastPrompt?: string;
+  /** Permission mode the session last recorded (`default`, `auto`, `plan`, ...). */
+  permissionMode?: string;
   permissionSent: boolean;
   hadToolsInTurn: boolean;
   /** Directory name — the agent's origin label (only set for multi-root workspaces) */
@@ -57,6 +73,17 @@ export interface AgentState {
   /** True once this transcript produced a main-chain turn, after which
    *  sidechain records belong to sub-agents and stop moving the gauge. */
   sawMainChainUsage?: boolean;
+  /** Tokens this conversation has spent, summed over every response -- unlike
+   *  contextTokens this only grows. */
+  totalTokens?: number;
+  /** totalTokens split by usage counter, plus what it would cost at API list
+   *  prices -- the counters are priced up to ~100x apart. costUsd is null once
+   *  any response came from a model the provider can't price. */
+  spend?: TokenSpend;
+  /** message.ids of the responses most recently counted into totalTokens (one
+   *  response is split over several records that repeat its usage, and
+   *  sub-agent records interleave with them). Bounded, oldest first. */
+  recentUsageMessageIds?: string[];
 
   // -- Agent Teams --
   teamName?: string;

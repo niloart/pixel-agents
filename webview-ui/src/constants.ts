@@ -560,3 +560,12 @@ export const VISUAL_VIEWPORT_FULL_EPSILON_PX = 1;
  *  (with an editable focused) = the software keyboard is up. Well above an
  *  address bar collapsing (~56 px), well below any on-screen keyboard. */
 export const KEYBOARD_MIN_HEIGHT_PX = 150;
+// ── Inbox ────────────────────────────────────────────────────
+/** A wait younger than this just happened (chime); older ones were found. */
+export const INBOX_FRESH_WAIT_MS = 10_000;
+/** How often the inbox re-renders its "há X min" ages. */
+export const INBOX_CLOCK_TICK_MS = 30_000;
+/** localStorage key for waits the user marked as seen. */
+export const INBOX_SEEN_STORAGE_KEY = 'pixel-agents.inbox.seen';
+/** Seen marks kept (oldest dropped) -- each is one finished wait. */
+export const INBOX_SEEN_MAX = 500;

@@ -32,6 +32,7 @@ import {
   WILDCARD_HOSTNAMES,
 } from './constants.js';
 import { FileStateAdapter } from './fileStateAdapter.js';
+import { startPlanUsagePolling } from './planUsage.js';
 import { claudeProvider, copyHookScript, hookProviderById } from './providers/index.js';
 import { PixelAgentsServer } from './server.js';
 import { PtySessionManager } from './terminal/ptySessionManager.js';
@@ -404,6 +405,8 @@ async function main(): Promise<void> {
       runtime.startStaleCheck();
     }
 
+    const stopPlanUsagePolling = startPlanUsagePolling(store);
+
     // The URL the operator opens has to be REACHABLE (a wildcard bind address
     // is a bind target, not an address you can browse to — `--host 0.0.0.0`
     // used to print a dead `http://0.0.0.0:PORT`) and has to carry the token,
@@ -427,6 +430,7 @@ async function main(): Promise<void> {
       // wait for them: exiting now would cancel the SIGKILL escalation and
       // leave a child that ignores SIGHUP orphaned on a dead server.
       await ptyManager.disposeAll();
+      stopPlanUsagePolling();
       runtime.dispose();
       server.stop();
       process.exit(0);

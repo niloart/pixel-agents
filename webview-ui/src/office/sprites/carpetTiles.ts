@@ -13,7 +13,7 @@
 
 import type { ColorValue } from '../../components/ui/types.js';
 import { CARPET_DEFAULT_ACCENT_COLOR, CARPET_DEFAULT_COLOR } from '../../constants.js';
-import { flatColorizeSprite } from '../colorize.js';
+import { flatColorizeSprite, lruGet, lruSet, SPRITE_CACHE_MAX_ENTRIES } from '../colorize.js';
 import type { CarpetTile, SpriteData } from '../types.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -26,8 +26,11 @@ let carpetSets: SpriteData[][] = [];
 /** Per-variant palette classification, computed once per `setCarpetSprites` call. */
 let carpetVariantPalettes: Array<{ mainRgb: string | null; accentRgb: string | null }> = [];
 
-/** Cache of fully-colorized + merged sprites, keyed by `${variant}:${msCase}:${paletteKey}`. */
+/** Cache of fully-colorized + merged sprites, keyed by `${variant}:${msCase}:${paletteKey}` (LRU-capped). */
 const carpetCache: Map<string, SpriteData> = new Map();
+
+/** Bumped on every setCarpetSprites so render caches can tell the sprites changed. */
+let carpetSpritesVersion = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -42,8 +45,13 @@ const carpetCache: Map<string, SpriteData> = new Map();
  */
 export function setCarpetSprites(sets: SpriteData[][]): void {
   carpetSets = sets;
+  carpetSpritesVersion++;
   carpetCache.clear();
   carpetVariantPalettes = sets.map((variantSprites) => classifyCarpetPalette(variantSprites));
+}
+
+export function getCarpetSpritesVersion(): number {
+  return carpetSpritesVersion;
 }
 
 export function hasCarpetSprites(): boolean {
@@ -242,7 +250,7 @@ function getDualColorizedCarpetSprite(
   color: ColorValue,
   accentColor: ColorValue,
 ): SpriteData | null {
-  const cached = carpetCache.get(cacheKey);
+  const cached = lruGet(carpetCache, cacheKey);
   if (cached) return cached;
 
   if (!palette.mainRgb) return null;
@@ -256,7 +264,7 @@ function getDualColorizedCarpetSprite(
   const accentLayer = flatColorizeSprite(accentMask, accentColor);
 
   const merged = mergeCarpetLayers(mainLayer, accentLayer);
-  carpetCache.set(cacheKey, merged);
+  lruSet(carpetCache, cacheKey, merged, SPRITE_CACHE_MAX_ENTRIES);
   return merged;
 }
 

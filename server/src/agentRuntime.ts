@@ -73,6 +73,9 @@ export class AgentRuntime {
   readonly activeAgentId = { current: null as number | null };
   private externalScanTimer: ReturnType<typeof setInterval> | null = null;
   private staleCheckTimer: ReturnType<typeof setInterval> | null = null;
+  /** Set by dispose(): shutdown tears agents down without persisting the
+   *  removals, so the on-disk state survives for the next restore. */
+  private disposing = false;
 
   // Configuration refs (mutable, shared with scanners)
   readonly watchAllSessions = { current: false };
@@ -273,7 +276,6 @@ export class AgentRuntime {
         // Unnamed background spawns die with their lead's session too.
         this.subagentWatch.removeByLead(agentId);
         if (agent.isExternal) {
-          this.unregisterAgent(agent.sessionId);
           this.removeAgent(agentId);
         }
       },
@@ -297,14 +299,17 @@ export class AgentRuntime {
     this.hookEventHandler.registerAgent(sessionId, agentId);
   }
 
-  /** Unregister an agent from the hook event handler. */
-  unregisterAgent(sessionId: string): void {
-    this.hookEventHandler.unregisterAgent(sessionId);
+  /** Unregister an agent from the hook event handler. With agentId, only if
+   *  the session still routes to that agent. */
+  unregisterAgent(sessionId: string, agentId?: number): void {
+    this.hookEventHandler.unregisterAgent(sessionId, agentId);
   }
 
   // ── Agent removal (shared cleanup) ──
 
-  /** Remove an agent: stop watchers, cancel timers, delete from store. */
+  /** Remove an agent: stop watchers, cancel timers, unregister its hook
+   *  session, delete from store, then take its teammates and shadow-watched
+   *  sub-agents with it. */
   removeAgent(id: number): void {
     const agent = this.store.get(id);
     if (!agent) return;
@@ -332,9 +337,17 @@ export class AgentRuntime {
     // Notify adapter before deleting from store
     this.lifecycleCallbacks.onAgentRemoved?.(id, agent);
 
+    // Ownership-checked: background/inline teammates share the lead's session
+    // id, and removing one must not knock the lead out of the session router.
+    if (agent.sessionId) this.unregisterAgent(agent.sessionId, id);
+
     // Remove from store (fires agentRemoved event) and persist
     this.store.delete(id);
-    this.store.persist();
+    // Children after the delete: the early return above then stops any
+    // leadAgentId cycle. No-ops when childless.
+    this.removeTeammates(id);
+    this.subagentWatch.removeByLead(id);
+    if (!this.disposing) this.store.persist();
   }
 
   /** Remove a single teammate agent. */
@@ -343,11 +356,6 @@ export class AgentRuntime {
     if (!agent) return;
     console.log(`[Pixel Agents] Removing teammate ${teammateId} (source: ${source})`);
     this.dismissalTracker.dismiss(agent.jsonlFile);
-    // Background teammates (spawnToolUseId set) share the LEAD's session id;
-    // unregistering it would knock the lead itself out of the session router.
-    if (!agent.spawnToolUseId) {
-      this.unregisterAgent(agent.sessionId);
-    }
     this.lifecycleCallbacks.onTeammateRemoved?.(teammateId, agent, source);
     this.removeAgent(teammateId);
     if (agent.leadAgentId !== undefined) {
@@ -404,9 +412,6 @@ export class AgentRuntime {
       if (agent) {
         console.log(`[Pixel Agents] Removing teammate ${id} (lead ${leadId} closed)`);
         this.dismissalTracker.dismiss(agent.jsonlFile);
-        if (!agent.spawnToolUseId) {
-          this.unregisterAgent(agent.sessionId);
-        }
         this.removeAgent(id);
       }
     }
@@ -556,6 +561,7 @@ export class AgentRuntime {
 
   /** Clean up all scanners, timers, and agents. Called on shutdown. */
   dispose(): void {
+    this.disposing = true;
     this.hookEventHandler.dispose();
     this.subagentWatch.dispose();
 

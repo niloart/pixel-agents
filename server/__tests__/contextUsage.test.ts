@@ -7,10 +7,13 @@ import { AgentStateStore } from '../src/agentStateStore.js';
 import { CONTEXT_SEED_TAIL_BYTES, DEFAULT_MAX_CONTEXT_TOKENS } from '../src/constants.js';
 import {
   extractContextTokens,
+  promptText,
   seedContextUsage,
+  seedSessionSummary,
   updateContextUsage,
   widenContextWindow,
 } from '../src/contextUsage.js';
+import { toWindows } from '../src/planUsage.js';
 import { claudeProvider, contextWindowForModel } from '../src/providers/hook/claude/claude.js';
 import type { AgentState } from '../src/types.js';
 
@@ -51,12 +54,14 @@ function assistantRecord(
     cacheRead?: number;
     output?: number;
     isSidechain?: boolean;
+    id?: string;
   } = {},
 ): Record<string, unknown> {
   return {
     type: 'assistant',
     isSidechain: opts.isSidechain ?? false,
     message: {
+      id: opts.id,
       model: 'claude-opus-5',
       usage: {
         input_tokens: opts.input ?? 2,
@@ -157,8 +162,54 @@ describe('updateContextUsage', () => {
         id: 1,
         contextTokens: 50_302,
         maxContextTokens: DEFAULT_MAX_CONTEXT_TOKENS,
+        totalTokens: 50_302,
+        inputTokens: 2,
+        cacheWriteTokens: 0,
+        cacheReadTokens: 50_000,
+        outputTokens: 300,
       },
     ]);
+  });
+
+  it('splits spend by counter and prices it, 1-hour cache writes at 2x input', () => {
+    const record = assistantRecord({ cacheRead: 1_000_000, output: 1_000, cacheCreation: 100_000 });
+    (record.message as { usage: Record<string, unknown> }).usage.cache_creation = {
+      ephemeral_5m_input_tokens: 0,
+      ephemeral_1h_input_tokens: 100_000,
+    };
+    updateContextUsage(1, agent, agents, record, claudeProvider);
+
+    // claude-opus-5: $5 in, $25 out, $0.50 cache read, $10 cache write (1h).
+    // The million cached tokens cost a third of what 100k cache writes do.
+    expect(agent.spend).toMatchObject({
+      inputTokens: 2,
+      cacheWriteTokens: 100_000,
+      cacheReadTokens: 1_000_000,
+      outputTokens: 1_000,
+    });
+    expect(agent.spend?.costUsd).toBeCloseTo(0.00001 + 0.5 + 0.025 + 1, 6);
+    expect(messages.at(-1)?.costUsd).toBeCloseTo(1.52501, 6);
+  });
+
+  it('withholds the cost once any response comes from an unpriced model', () => {
+    updateContextUsage(1, agent, agents, assistantRecord({ id: 'a', output: 10 }), claudeProvider);
+    const unknown = assistantRecord({ id: 'b', output: 10 });
+    (unknown.message as { model: string }).model = 'claude-3-opus-20240229';
+    updateContextUsage(1, agent, agents, unknown, claudeProvider);
+
+    expect(agent.spend?.costUsd).toBeNull();
+    expect(messages.at(-1)).not.toHaveProperty('costUsd', expect.anything());
+  });
+
+  it('sums spend across responses, counting a response split over records once', () => {
+    // One response = one record per content block, each repeating its usage.
+    for (let i = 0; i < 3; i++) {
+      updateContextUsage(1, agent, agents, assistantRecord({ cacheRead: 1_000, id: 'msg_a' }));
+    }
+    updateContextUsage(1, agent, agents, assistantRecord({ cacheRead: 2_000, id: 'msg_b' }));
+
+    expect(agent.totalTokens).toBe(1_002 + 2_002);
+    expect(agent.contextTokens).toBe(2_002);
   });
 
   it('snapshots rather than accumulates: the gauge falls after a compaction', () => {
@@ -185,7 +236,9 @@ describe('updateContextUsage', () => {
     updateContextUsage(1, agent, agents, assistantRecord({ cacheRead: 8_000, isSidechain: true }));
 
     expect(agent.contextTokens).toBe(120_002);
-    expect(messages).toHaveLength(1);
+    // ...but they are this conversation's spend, so only the total moves.
+    expect(agent.totalTokens).toBe(128_004);
+    expect(messages.at(-1)).toMatchObject({ contextTokens: 120_002, totalTokens: 128_004 });
   });
 
   it("measures against the provider's window for the model that wrote the turn", () => {
@@ -334,5 +387,221 @@ describe('seedContextUsage', () => {
 
     expect(agent.contextTokens).toBe(12_345);
     expect(messages).toHaveLength(0);
+  });
+});
+
+describe('seedSessionSummary', () => {
+  let tmpDir: string;
+  let agents: AgentStateStore;
+  let messages: Array<Record<string, unknown>>;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pixel-agents-summary-'));
+    agents = new AgentStateStore();
+    messages = [];
+    agents.on('broadcast', (msg) => messages.push(msg as Record<string, unknown>));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  /** Adopt a transcript the way the scanner does: watching starts at EOF. */
+  function adopt(records: Array<Record<string, unknown>>): AgentState {
+    const file = path.join(tmpDir, 'session.jsonl');
+    fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(file, old, old);
+    const agent = createTestAgent({ jsonlFile: file, fileOffset: fs.statSync(file).size });
+    agents.set(agent.id, agent);
+    seedSessionSummary(agent.id, agents);
+    return agent;
+  }
+
+  const prompt = { type: 'user', message: { content: 'do the thing' } };
+  const reply = (at: string, id: string) => ({
+    ...assistantRecord({ cacheRead: 1_000, id }),
+    timestamp: at,
+    message: {
+      id,
+      content: [{ type: 'text', text: 'done' }],
+      usage: { input_tokens: 2, cache_read_input_tokens: 1_000 },
+    },
+  });
+  // Claude Desktop writes no turn_duration; this is its turn end.
+  const desktopTurnEnd = (at: string) => ({
+    type: 'system',
+    subtype: 'stop_hook_summary',
+    timestamp: at,
+  });
+
+  it('finds a conversation that answered and was never read, with when it answered', () => {
+    const agent = adopt([
+      prompt,
+      reply('2026-10-03T10:00:00.000Z', 'msg_1'),
+      reply('2026-10-03T10:00:00.000Z', 'msg_1'),
+      desktopTurnEnd('2026-10-03T10:00:01.000Z'),
+    ]);
+
+    expect(agent.isWaiting).toBe(true);
+    expect(agent.waitingSince).toBe(Date.parse('2026-10-03T10:00:01.000Z'));
+    expect(agent.totalTokens).toBe(1_002);
+    expect(agent.lastPrompt).toBe('do the thing');
+    expect(messages).toContainEqual(
+      expect.objectContaining({
+        type: 'agentStatus',
+        status: 'waiting',
+        since: agent.waitingSince,
+      }),
+    );
+  });
+
+  it('is not waiting once the user replied after the turn end', () => {
+    const agent = adopt([
+      prompt,
+      reply('2026-10-03T10:00:00.000Z', 'msg_1'),
+      desktopTurnEnd('2026-10-03T10:00:01.000Z'),
+      prompt,
+    ]);
+
+    expect(agent.isWaiting).toBe(false);
+    expect(messages.some((m) => m.type === 'agentStatus')).toBe(false);
+  });
+
+  it('a local slash command after the turn end keeps the conversation waiting', () => {
+    const agent = adopt([
+      prompt,
+      reply('2026-10-03T10:00:00.000Z', 'msg_1'),
+      desktopTurnEnd('2026-10-03T10:00:01.000Z'),
+      { type: 'user', isMeta: true, message: { content: '<local-command-caveat>...' } },
+      { type: 'user', message: { content: '<command-name>/context</command-name>' } },
+      { type: 'system', subtype: 'local_command', content: '<local-command-stdout>..' },
+    ]);
+
+    expect(agent.waitingSince).toBe(Date.parse('2026-10-03T10:00:01.000Z'));
+  });
+
+  it('an interrupt mid-tool is the turn end', () => {
+    const agent = adopt([
+      prompt,
+      {
+        type: 'assistant',
+        message: { id: 'msg_1', content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] },
+      },
+      {
+        type: 'user',
+        timestamp: '2026-10-03T10:00:02.000Z',
+        message: {
+          content: [{ type: 'text', text: '[Request interrupted by user for tool use]' }],
+        },
+      },
+    ]);
+
+    expect(agent.waitingSince).toBe(Date.parse('2026-10-03T10:00:02.000Z'));
+  });
+
+  it('treats a trailing text-only reply as the turn end when no marker was written', () => {
+    const agent = adopt([prompt, reply('2026-10-03T10:00:00.000Z', 'msg_1')]);
+
+    expect(agent.waitingSince).toBe(Date.parse('2026-10-03T10:00:00.000Z'));
+  });
+
+  it('finds a conversation left on an open question', () => {
+    const asked = {
+      type: 'assistant',
+      timestamp: '2026-10-03T10:00:00.000Z',
+      message: { id: 'msg_1', content: [{ type: 'tool_use', id: 't1', name: 'AskUserQuestion' }] },
+    };
+    const file = path.join(tmpDir, 'asked.jsonl');
+    fs.writeFileSync(file, [prompt, asked].map((r) => JSON.stringify(r)).join('\n') + '\n');
+    const old = new Date(Date.now() - 60_000);
+    fs.utimesSync(file, old, old);
+    const agent = createTestAgent({ jsonlFile: file, fileOffset: fs.statSync(file).size });
+    agents.set(agent.id, agent);
+    seedSessionSummary(agent.id, agents, claudeProvider);
+
+    expect(agent.waitingSince).toBe(Date.parse('2026-10-03T10:00:00.000Z'));
+  });
+
+  it('is not waiting while a tool call is still open', () => {
+    const agent = adopt([
+      prompt,
+      {
+        type: 'assistant',
+        message: { id: 'msg_1', content: [{ type: 'tool_use', id: 't1', name: 'Bash' }] },
+      },
+    ]);
+
+    expect(agent.isWaiting).toBe(false);
+  });
+});
+
+describe('promptText', () => {
+  it('keeps what the user typed and skips what the harness injected', () => {
+    expect(promptText({ type: 'user', message: { content: 'fix the login\nplease' } })).toBe(
+      'fix the login',
+    );
+    expect(promptText({ type: 'user', message: { content: [{ type: 'text', text: 'oi' }] } })).toBe(
+      'oi',
+    );
+    for (const injected of [
+      { type: 'user', isMeta: true, message: { content: '[Image: original 390x3533]' } },
+      { type: 'user', message: { content: '<command-name>/clear</command-name>' } },
+      { type: 'user', message: { content: '[Request interrupted by user for tool use]' } },
+      { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 't1' }] } },
+      { type: 'assistant', message: { content: 'not a prompt' } },
+    ]) {
+      expect(promptText(injected)).toBeUndefined();
+    }
+  });
+});
+
+describe('planUsage toWindows', () => {
+  it('maps the limits Claude reports into 5h / weekly / per-model windows', () => {
+    // Shape of the real response (trimmed).
+    expect(
+      toWindows([
+        {
+          kind: 'session',
+          group: 'session',
+          percent: 9,
+          resets_at: '2026-10-03T15:10:00+00:00',
+          scope: null,
+        },
+        {
+          kind: 'weekly_all',
+          group: 'weekly',
+          percent: 15,
+          resets_at: '2026-10-05T03:00:00+00:00',
+          scope: null,
+        },
+        {
+          kind: 'weekly_scoped',
+          group: 'weekly',
+          percent: 0,
+          resets_at: '2026-10-05T03:00:00+00:00',
+          scope: { model: { display_name: 'Fable' } },
+        },
+      ]),
+    ).toEqual([
+      {
+        kind: 'session',
+        model: undefined,
+        percent: 9,
+        resetsAt: Date.parse('2026-10-03T15:10:00Z'),
+      },
+      {
+        kind: 'weekly',
+        model: undefined,
+        percent: 15,
+        resetsAt: Date.parse('2026-10-05T03:00:00Z'),
+      },
+      {
+        kind: 'weekly_model',
+        model: 'Fable',
+        percent: 0,
+        resetsAt: Date.parse('2026-10-05T03:00:00Z'),
+      },
+    ]);
   });
 });

@@ -9,7 +9,28 @@
 import type { ColorValue } from '../components/ui/types.js';
 import type { SpriteData } from './types.js';
 
-/** Generic colorized sprite cache: arbitrary string key → SpriteData */
+/** Entry cap for the colorized-sprite caches. Every colour-slider tick mints new
+ *  keys, and each cached SpriteData pins its per-zoom canvases in spriteCache. */
+export const SPRITE_CACHE_MAX_ENTRIES = 512;
+
+/** LRU read on a Map (iteration order = insertion order): a hit is re-inserted
+ *  so it becomes the newest entry. */
+export function lruGet<V>(cache: Map<string, V>, key: string): V | undefined {
+  const value = cache.get(key);
+  if (value !== undefined) {
+    cache.delete(key);
+    cache.set(key, value);
+  }
+  return value;
+}
+
+/** LRU write on a Map: evicts the oldest entry once `max` is exceeded. */
+export function lruSet<V>(cache: Map<string, V>, key: string, value: V, max: number): void {
+  cache.set(key, value);
+  if (cache.size > max) cache.delete(cache.keys().next().value as string);
+}
+
+/** Generic colorized sprite cache: arbitrary string key → SpriteData (LRU-capped) */
 const colorizeCache = new Map<string, SpriteData>();
 
 /**
@@ -22,10 +43,10 @@ export function getColorizedSprite(
   sprite: SpriteData,
   color: ColorValue,
 ): SpriteData {
-  const cached = colorizeCache.get(cacheKey);
+  const cached = lruGet(colorizeCache, cacheKey);
   if (cached) return cached;
   const result = color.colorize ? colorizeSprite(sprite, color) : adjustSprite(sprite, color);
-  colorizeCache.set(cacheKey, result);
+  lruSet(colorizeCache, cacheKey, result, SPRITE_CACHE_MAX_ENTRIES);
   return result;
 }
 

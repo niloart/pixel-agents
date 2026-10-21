@@ -249,11 +249,16 @@ function registerWebSocketRoute(
 
     // Handle incoming client messages
     socket.on('message', (data: Buffer | string) => {
+      let msg: Record<string, unknown>;
       try {
-        const msg = JSON.parse(data.toString()) as Record<string, unknown>;
-        if (!options.embedded && msg.type) {
-          console.log('[Pixel Agents] WS client message:', msg.type);
-        }
+        msg = JSON.parse(data.toString()) as Record<string, unknown>;
+      } catch {
+        return; // Malformed JSON, ignore
+      }
+      if (!options.embedded && msg.type) {
+        console.log('[Pixel Agents] WS client message:', msg.type);
+      }
+      try {
         handleClientMessage(msg, (m) => safeSend(socket, m), {
           store,
           runtime: options.runtime,
@@ -263,8 +268,8 @@ function registerWebSocketRoute(
           privileged,
           ptyManager: options.ptyManager,
         });
-      } catch {
-        // Malformed JSON, ignore
+      } catch (err) {
+        console.error(`[Pixel Agents] WS client message '${String(msg.type)}' failed:`, err);
       }
     });
 

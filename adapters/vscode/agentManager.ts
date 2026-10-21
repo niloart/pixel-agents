@@ -181,9 +181,11 @@ export async function launchNewTerminal(
           `[Pixel Agents] Terminal: Agent ${id} - JSONL file not found after 10s. ` +
             `Expected: ${agent.jsonlFile}. ${dirContents}`,
         );
-      } else if (pollCount > 10) {
+      } else if (pollCount > 10 && (pollCount <= 60 || pollCount % 10 === 0)) {
         // Possible /resume: terminal started a different session than expected.
-        // Check every tick for a file modified after the agent was created.
+        // Check for a file modified after the agent was created: every tick for
+        // the first minute, then every 10th -- a terminal can sit unprompted
+        // (no JSONL yet) for hours, and each check stats the whole project dir.
         try {
           const trackedFiles = new Set([...agents.values()].map((a) => path.resolve(a.jsonlFile)));
           const candidates = fs

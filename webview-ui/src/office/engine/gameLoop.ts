@@ -29,8 +29,20 @@ export function startGameLoop(canvas: HTMLCanvasElement, callbacks: GameLoopCall
 
   rafId = requestAnimationFrame(frame);
 
+  // Stop the loop entirely while the page is hidden; on return restart with
+  // lastTime = 0 so the first frame advances by dt = 0, not the hidden span.
+  const onVisibilityChange = () => {
+    if (stopped) return;
+    cancelAnimationFrame(rafId);
+    if (document.hidden) return;
+    lastTime = 0;
+    rafId = requestAnimationFrame(frame);
+  };
+  document.addEventListener('visibilitychange', onVisibilityChange);
+
   return () => {
     stopped = true;
     cancelAnimationFrame(rafId);
+    document.removeEventListener('visibilitychange', onVisibilityChange);
   };
 }

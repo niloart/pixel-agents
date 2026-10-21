@@ -25,6 +25,7 @@ export type ServerMessage =
   | SubagentToolPermission
   | AgentTeamInfo
   | AgentContextUsage
+  | PlanUsage
   | LayoutLoaded
   | FurnitureAssetsLoaded
   | CharacterSpritesLoaded
@@ -121,6 +122,8 @@ export interface AgentStatus {
   id: number;
   status: AgentActivityStatus;
   awaitingInput?: boolean;
+  since?: number;
+  prompt?: string;
 }
 
 export type AgentActivityStatus = 'active' | 'waiting';
@@ -199,6 +202,25 @@ export interface AgentContextUsage {
   id: number;
   contextTokens: number;
   maxContextTokens: number;
+  totalTokens?: number;
+  inputTokens?: number;
+  cacheWriteTokens?: number;
+  cacheReadTokens?: number;
+  outputTokens?: number;
+  costUsd?: number;
+}
+
+export interface PlanUsage {
+  type: 'planUsage';
+  windows: PlanUsageWindow[];
+  error?: string;
+}
+
+export interface PlanUsageWindow {
+  kind: string;
+  model?: string;
+  percent: number;
+  resetsAt?: number;
 }
 
 export interface LayoutLoaded {
